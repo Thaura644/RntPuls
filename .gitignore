@@ -1,0 +1,8 @@
+.env
+node_modules/
+frontend/node_modules/
+frontend/dist/
+coverage/
+*.log
+.DS_Store
+postgres_data/
