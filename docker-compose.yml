@@ -32,8 +32,12 @@ services:
       MPESA_CONSUMER_KEY: ${MPESA_CONSUMER_KEY:-}
       MPESA_CONSUMER_SECRET: ${MPESA_CONSUMER_SECRET:-}
       MPESA_SHORT_CODE: ${MPESA_SHORT_CODE:-}
+      UPLOAD_DIR: /app/uploads
+      PUBLIC_BASE_URL: http://localhost:8080
     ports:
       - "8080:8080"
+    volumes:
+      - uploads:/app/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -51,3 +55,4 @@ services:
 
 volumes:
   postgres_data:
+  uploads:

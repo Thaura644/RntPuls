@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
@@ -15,6 +16,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +42,7 @@ type authUser struct {
 	Email          string
 	Role           string
 	FullName       string
+	TenantID       string
 }
 
 type ctxKey string
@@ -55,20 +59,25 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/plans", a.plans)
 	mux.HandleFunc("POST /api/auth/register", a.register)
 	mux.HandleFunc("POST /api/auth/login", a.login)
-	mux.Handle("GET /api/me", a.auth(http.HandlerFunc(a.me)))
-	mux.Handle("GET /api/dashboard", a.auth(http.HandlerFunc(a.dashboard)))
-	mux.Handle("GET /api/settings", a.auth(http.HandlerFunc(a.settings)))
-	mux.Handle("PUT /api/settings", a.auth(http.HandlerFunc(a.updateSettings)))
-	mux.Handle("GET /api/properties", a.auth(http.HandlerFunc(a.listProperties)))
-	mux.Handle("POST /api/properties", a.auth(http.HandlerFunc(a.createProperty)))
-	mux.Handle("GET /api/tenants", a.auth(http.HandlerFunc(a.listTenants)))
-	mux.Handle("POST /api/tenants", a.auth(http.HandlerFunc(a.createTenant)))
-	mux.Handle("POST /api/imports/tenants", a.auth(http.HandlerFunc(a.importTenants)))
-	mux.Handle("GET /api/exports/tenants.csv", a.auth(http.HandlerFunc(a.exportTenantsCSV)))
-	mux.Handle("GET /api/reports/monthly.xlsx", a.auth(http.HandlerFunc(a.monthlyExcelReport)))
-	mux.Handle("POST /api/payments/mark-paid", a.auth(http.HandlerFunc(a.markPaid)))
-	mux.Handle("POST /api/payments/verify", a.auth(http.HandlerFunc(a.verifyPayment)))
-	mux.Handle("POST /api/communications/reminders/run", a.auth(http.HandlerFunc(a.runReminders)))
+	mux.Handle("GET /api/me", a.staffAuth(http.HandlerFunc(a.me)))
+	mux.Handle("GET /api/dashboard", a.staffAuth(http.HandlerFunc(a.dashboard)))
+	mux.Handle("GET /api/settings", a.staffAuth(http.HandlerFunc(a.settings)))
+	mux.Handle("PUT /api/settings", a.staffAuth(http.HandlerFunc(a.updateSettings)))
+	mux.Handle("GET /api/properties", a.staffAuth(http.HandlerFunc(a.listProperties)))
+	mux.Handle("POST /api/properties", a.staffAuth(http.HandlerFunc(a.createProperty)))
+	mux.Handle("GET /api/tenants", a.staffAuth(http.HandlerFunc(a.listTenants)))
+	mux.Handle("POST /api/tenants", a.staffAuth(http.HandlerFunc(a.createTenant)))
+	mux.Handle("POST /api/tenants/{tenantID}/access-link", a.staffAuth(http.HandlerFunc(a.createTenantAccessLink)))
+	mux.Handle("POST /api/imports/tenants", a.staffAuth(http.HandlerFunc(a.importTenants)))
+	mux.Handle("GET /api/exports/tenants.csv", a.staffAuth(http.HandlerFunc(a.exportTenantsCSV)))
+	mux.Handle("GET /api/reports/monthly.xlsx", a.staffAuth(http.HandlerFunc(a.monthlyExcelReport)))
+	mux.Handle("POST /api/payments/mark-paid", a.staffAuth(http.HandlerFunc(a.markPaid)))
+	mux.Handle("POST /api/payments/verify", a.staffAuth(http.HandlerFunc(a.verifyPayment)))
+	mux.Handle("POST /api/communications/reminders/run", a.staffAuth(http.HandlerFunc(a.runReminders)))
+	mux.Handle("GET /api/tenant/me", a.tenantAuth(http.HandlerFunc(a.tenantMe)))
+	mux.Handle("POST /api/tenant/uploads", a.tenantAuth(http.HandlerFunc(a.tenantUpload)))
+	mux.Handle("POST /api/tenant/payments/mark-paid", a.tenantAuth(http.HandlerFunc(a.tenantMarkPaid)))
+	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(a.cfg.UploadDir))))
 	return a.cors(a.recover(mux))
 }
 
@@ -334,6 +343,26 @@ func (a *App) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"id": tenantID})
 }
 
+func (a *App) createTenantAccessLink(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	tenantID := r.PathValue("tenantID")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant id is required")
+		return
+	}
+	var exists bool
+	if err := a.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM tenants WHERE id=$1 AND organization_id=$2)`, tenantID, u.OrganizationID).Scan(&exists); err != nil || !exists {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	token, err := a.tenantToken(u.OrganizationID, tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "tenant token create failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": strings.TrimRight(a.cfg.FrontendOrigin, "/") + "/tenant?token=" + url.QueryEscape(token), "expires_in_days": "30"})
+}
+
 func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	file, header, err := r.FormFile("file")
@@ -462,6 +491,111 @@ func (a *App) markPaid(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "pending_verification"})
 }
 
+func (a *App) tenantMe(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	rows, err := a.db.Query(r.Context(), `SELECT pi.id, pi.due_on, pi.amount_cents, pi.status, p.name AS property_name, un.label AS unit_label
+		FROM payment_intents pi
+		JOIN leases l ON l.id=pi.lease_id
+		JOIN units un ON un.id=l.unit_id
+		JOIN properties p ON p.id=un.property_id
+		WHERE pi.organization_id=$1 AND l.tenant_id=$2 AND pi.status IN ('due','overdue','tenant_marked_paid','rejected')
+		ORDER BY pi.due_on DESC`, u.OrganizationID, u.TenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "tenant payment query failed")
+		return
+	}
+	defer rows.Close()
+	var tenant struct {
+		ID       string           `json:"id"`
+		FullName string           `json:"full_name"`
+		Phone    string           `json:"phone"`
+		Email    string           `json:"email"`
+		Payments []map[string]any `json:"payments"`
+	}
+	if err := a.db.QueryRow(r.Context(), `SELECT id, full_name, phone, email FROM tenants WHERE id=$1 AND organization_id=$2`, u.TenantID, u.OrganizationID).Scan(&tenant.ID, &tenant.FullName, &tenant.Phone, &tenant.Email); err != nil {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	tenant.Payments = collect(rows)
+	writeJSON(w, http.StatusOK, tenant)
+}
+
+func (a *App) tenantUpload(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "upload must be 8MB or smaller")
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "file field is required")
+		return
+	}
+	defer file.Close()
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".pdf" {
+		writeError(w, http.StatusBadRequest, "only jpg, png, or pdf evidence is accepted")
+		return
+	}
+	token, err := randomHex(16)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "file token failed")
+		return
+	}
+	dir := filepath.Join(a.cfg.UploadDir, u.OrganizationID, u.TenantID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		writeError(w, http.StatusInternalServerError, "upload directory failed")
+		return
+	}
+	path := filepath.Join(dir, token+ext)
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "upload create failed")
+		return
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, io.LimitReader(file, 8<<20)); err != nil {
+		writeError(w, http.StatusInternalServerError, "upload write failed")
+		return
+	}
+	publicPath := "/uploads/" + url.PathEscape(u.OrganizationID) + "/" + url.PathEscape(u.TenantID) + "/" + url.PathEscape(token+ext)
+	writeJSON(w, http.StatusCreated, map[string]string{"url": strings.TrimRight(a.cfg.PublicBaseURL, "/") + publicPath, "path": publicPath})
+}
+
+func (a *App) tenantMarkPaid(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	var in struct {
+		PaymentIntentID string `json:"payment_intent_id"`
+		AmountCents     int64  `json:"amount_cents"`
+		Provider        string `json:"provider"`
+		TransactionRef  string `json:"transaction_ref"`
+		EvidenceURL     string `json:"evidence_url"`
+	}
+	if !decode(w, r, &in) || in.PaymentIntentID == "" || in.TransactionRef == "" {
+		writeError(w, http.StatusBadRequest, "payment intent and transaction reference are required")
+		return
+	}
+	var expectedAmount int64
+	err := a.db.QueryRow(r.Context(), `SELECT pi.amount_cents
+		FROM payment_intents pi
+		JOIN leases l ON l.id=pi.lease_id
+		WHERE pi.id=$1 AND pi.organization_id=$2 AND l.tenant_id=$3`, in.PaymentIntentID, u.OrganizationID, u.TenantID).Scan(&expectedAmount)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "payment intent not found")
+		return
+	}
+	if in.AmountCents <= 0 {
+		in.AmountCents = expectedAmount
+	}
+	_, err = a.db.Exec(r.Context(), `INSERT INTO payment_confirmations (organization_id,payment_intent_id,tenant_id,amount_cents,provider,transaction_ref,evidence_url) VALUES ($1,$2,$3,$4,$5,$6,$7);
+		UPDATE payment_intents SET status='tenant_marked_paid' WHERE id=$2 AND organization_id=$1`, u.OrganizationID, in.PaymentIntentID, u.TenantID, in.AmountCents, in.Provider, in.TransactionRef, in.EvidenceURL)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "payment confirmation failed")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"status": "pending_landlord_verification"})
+}
+
 func (a *App) verifyPayment(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	var in struct {
@@ -527,7 +661,11 @@ func (a *App) runReminders(w http.ResponseWriter, r *http.Request) {
 		if status == "overdue" {
 			body = escalation
 		}
-		body = render(body, map[string]string{"tenant": tenant, "amount": "KES " + money(amount), "unit": property + " " + unit, "due_date": due.Format("2 Jan 2006")})
+		link := ""
+		if token, err := a.tenantToken(u.OrganizationID, tenantID); err == nil {
+			link = strings.TrimRight(a.cfg.FrontendOrigin, "/") + "/tenant?token=" + url.QueryEscape(token)
+		}
+		body = render(body, map[string]string{"tenant": tenant, "amount": "KES " + money(amount), "unit": property + " " + unit, "due_date": due.Format("2 Jan 2006"), "tenant_link": link})
 		msgID, sendErr := a.sendMessage(r.Context(), "sms", phone, body)
 		commStatus, errText := "sent", ""
 		if errors.Is(sendErr, errProviderNotConfigured) {
@@ -631,13 +769,40 @@ func (a *App) auth(next http.Handler) http.Handler {
 			return
 		}
 		claims := token.Claims.(jwt.MapClaims)
-		u := authUser{ID: fmt.Sprint(claims["sub"]), OrganizationID: fmt.Sprint(claims["org"]), Email: fmt.Sprint(claims["email"]), Role: fmt.Sprint(claims["role"]), FullName: fmt.Sprint(claims["name"])}
+		u := authUser{ID: fmt.Sprint(claims["sub"]), OrganizationID: fmt.Sprint(claims["org"]), Email: fmt.Sprint(claims["email"]), Role: fmt.Sprint(claims["role"]), FullName: fmt.Sprint(claims["name"]), TenantID: fmt.Sprint(claims["tenant_id"])}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
 	})
 }
 
+func (a *App) tenantAuth(next http.Handler) http.Handler {
+	return a.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := mustUser(r)
+		if u.Role != "tenant" || u.TenantID == "" || u.TenantID == "<nil>" {
+			writeError(w, http.StatusForbidden, "tenant portal token required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
+func (a *App) staffAuth(next http.Handler) http.Handler {
+	return a.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := mustUser(r)
+		if u.Role == "tenant" {
+			writeError(w, http.StatusForbidden, "staff account required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
 func (a *App) token(u authUser) (string, error) {
 	claims := jwt.MapClaims{"sub": u.ID, "org": u.OrganizationID, "email": u.Email, "role": u.Role, "name": u.FullName, "exp": time.Now().Add(24 * time.Hour).Unix(), "iat": time.Now().Unix()}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.cfg.JWTSecret))
+}
+
+func (a *App) tenantToken(orgID, tenantID string) (string, error) {
+	claims := jwt.MapClaims{"sub": tenantID, "tenant_id": tenantID, "org": orgID, "role": "tenant", "exp": time.Now().Add(30 * 24 * time.Hour).Unix(), "iat": time.Now().Unix()}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.cfg.JWTSecret))
 }
 
@@ -706,7 +871,7 @@ func readTenantImport(file multipart.File, header *multipart.FileHeader) ([][3]s
 
 func collect(rows pgx.Rows) []map[string]any {
 	fields := rows.FieldDescriptions()
-	var out []map[string]any
+	out := []map[string]any{}
 	for rows.Next() {
 		values, _ := rows.Values()
 		item := map[string]any{}
@@ -750,4 +915,12 @@ func render(template string, values map[string]string) string {
 		template = strings.ReplaceAll(template, "{{"+key+"}}", value)
 	}
 	return template
+}
+
+func randomHex(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", buf), nil
 }

@@ -8,6 +8,7 @@ RentPulse is a production-oriented rent collection platform for small landlords 
 - Go API with Postgres-backed organizations, users, properties, units, tenants, leases, payment intents, confirmations, communications, import jobs, and organization settings.
 - Tenant CSV/XLSX imports, tenant CSV exports, and monthly Excel reports.
 - Payment marking and landlord verification workflow, with optional M-Pesa transaction-status verification when Daraja credentials are configured.
+- Tenant portal links for tenants to upload screenshots/PDF evidence and submit payment references without landlord account access.
 - SMS reminder execution through Twilio when credentials are configured; skipped sends are recorded when the provider is not configured.
 - Docker Compose for API, web, and Postgres.
 - GitHub Actions CI for backend tests, frontend build, and Docker build.
@@ -45,3 +46,7 @@ MPESA_CONSUMER_KEY=
 MPESA_CONSUMER_SECRET=
 MPESA_SHORT_CODE=
 ```
+
+## Tenant access
+
+Landlords generate a tenant portal link from the tenant directory. The link opens `/tenant?token=...`, where the tenant can upload a JPG, PNG, or PDF proof of payment and submit the transaction reference. That submission creates a pending confirmation for landlord verification.

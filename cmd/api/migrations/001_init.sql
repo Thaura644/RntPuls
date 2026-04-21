@@ -113,8 +113,8 @@ CREATE TABLE IF NOT EXISTS organization_settings (
   mpesa_till TEXT NOT NULL DEFAULT '',
   sms_sender_id TEXT NOT NULL DEFAULT 'RentPulse',
   reminder_before_days INT NOT NULL DEFAULT 3,
-  reminder_template TEXT NOT NULL DEFAULT 'Hello {{tenant}}, rent of {{amount}} for {{unit}} is due on {{due_date}}.',
-  escalation_template TEXT NOT NULL DEFAULT 'Hello {{tenant}}, rent of {{amount}} for {{unit}} is overdue. Please pay today or contact management.',
+  reminder_template TEXT NOT NULL DEFAULT 'Hello {{tenant}}, rent of {{amount}} for {{unit}} is due on {{due_date}}. Upload proof here: {{tenant_link}}',
+  escalation_template TEXT NOT NULL DEFAULT 'Hello {{tenant}}, rent of {{amount}} for {{unit}} is overdue. Please pay today or upload proof here: {{tenant_link}}',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

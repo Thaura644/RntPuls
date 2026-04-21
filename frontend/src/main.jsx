@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Bell, Building2, CheckCircle2, Download, FileSpreadsheet, Home, LogOut, MessageSquareText, Plus, Search, Settings, ShieldCheck, Upload, Users, WalletCards } from 'lucide-react';
 import './styles.css';
@@ -6,10 +6,11 @@ import './styles.css';
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8080/api';
 
 function request(path, options = {}) {
-  const token = localStorage.getItem('rentpulse_token');
+  const token = options.token || localStorage.getItem('rentpulse_token');
   const headers = options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
-  return fetch(`${API}${path}`, { ...options, headers: { ...headers, ...(options.headers || {}) } }).then(async (res) => {
+  const { token: _token, ...fetchOptions } = options;
+  return fetch(`${API}${path}`, { ...fetchOptions, headers: { ...headers, ...(options.headers || {}) } }).then(async (res) => {
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || `Request failed with ${res.status}`);
@@ -20,6 +21,11 @@ function request(path, options = {}) {
 }
 
 function App() {
+  const tenantToken = new URLSearchParams(window.location.search).get('token');
+  if (window.location.pathname === '/tenant' && tenantToken) {
+    return <TenantPortal token={tenantToken} />;
+  }
+
   const [token, setToken] = useState(localStorage.getItem('rentpulse_token'));
   const [route, setRoute] = useState(token ? 'dashboard' : 'landing');
   const [user, setUser] = useState(null);
@@ -46,13 +52,48 @@ function App() {
   if (!token) return <Landing onAuth={() => setRoute('auth')} />;
 
   return (
-    <Shell route={route} setRoute={setRoute} user={user} logout={logout}>
-      {route === 'dashboard' && <Dashboard />}
-      {route === 'tenants' && <Tenants />}
-      {route === 'pricing' && <Pricing />}
-      {route === 'settings' && <SettingsPage />}
-    </Shell>
+    <ErrorBoundary route={route}>
+      <Shell route={route} setRoute={setRoute} user={user} logout={logout}>
+        {route === 'dashboard' && <Dashboard />}
+        {route === 'tenants' && <Tenants />}
+        {route === 'pricing' && <Pricing />}
+        {route === 'settings' && <SettingsPage />}
+      </Shell>
+    </ErrorBoundary>
   );
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidUpdate(prevProps) {
+    if (prevProps.route !== this.props.route && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="authPage">
+          <section className="authCard">
+            <strong className="brand">RentPulse</strong>
+            <h1>Something needs attention</h1>
+            <p className="error">{this.state.error.message}</p>
+            <button className="btn primary" onClick={() => window.location.reload()}>Reload</button>
+          </section>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 function Landing({ onAuth }) {
@@ -104,7 +145,11 @@ function Auth({ onLogin, onBack }) {
       const out = await request(path, { method: 'POST', body: JSON.stringify(body) });
       onLogin(out.token);
     } catch (err) {
-      setError(err.message);
+      if (mode === 'register' && err.message.includes('already registered')) {
+        setError('That email already has an account. Switch to sign in below.');
+      } else {
+        setError(err.message);
+      }
     }
   }
   return (
@@ -180,8 +225,15 @@ function Tenants() {
   const [form, setForm] = useState({ full_name: '', phone: '', email: '' });
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const load = () => request('/tenants').then(setTenants).catch(e => setError(e.message));
-  useEffect(load, []);
+  const load = () => {
+    setError('');
+    return request('/tenants')
+      .then(data => setTenants(Array.isArray(data) ? data : []))
+      .catch(e => setError(e.message));
+  };
+  useEffect(() => {
+    load();
+  }, []);
   async function add(e) {
     e.preventDefault();
     setError('');
@@ -194,6 +246,13 @@ function Tenants() {
     body.append('file', file);
     const out = await request('/imports/tenants', { method: 'POST', body }).catch(e => setError(e.message));
     if (out) { setNotice(`Imported ${out.imported_rows} of ${out.total_rows} rows`); load(); }
+  }
+  async function copyTenantLink(tenantID) {
+    setError('');
+    const out = await request(`/tenants/${tenantID}/access-link`, { method: 'POST', body: '{}' }).catch(e => setError(e.message));
+    if (!out) return;
+    await navigator.clipboard.writeText(out.url);
+    setNotice('Tenant portal link copied. Send it by SMS or WhatsApp.');
   }
   return (
     <Page title="Resident directory" subtitle="Tenant records come from the API. Add one manually or import a CSV/XLSX file.">
@@ -210,15 +269,91 @@ function Tenants() {
       </div>
       {error && <p className="error">{error}</p>}{notice && <p className="notice">{notice}</p>}
       <section className="panel tablePanel">
-        {tenants.length === 0 ? <Empty title="No tenants yet" text="Create or import tenants to populate your ledger." /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td>{t.full_name}</td><td>{t.phone}</td><td>{t.email}</td><td>{t.property_name}</td><td>{t.unit_label}</td><td>{kes(t.rent_cents || 0)}</td></tr>)}</tbody></table>}
+        {tenants.length === 0 ? <Empty title="No tenants yet" text="Create or import tenants to populate your ledger." /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th><th>Tenant access</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td>{t.full_name}</td><td>{t.phone}</td><td>{t.email}</td><td>{t.property_name}</td><td>{t.unit_label}</td><td>{kes(t.rent_cents || 0)}</td><td><button className="linkButton" onClick={() => copyTenantLink(t.id)}>Copy link</button></td></tr>)}</tbody></table>}
       </section>
     </Page>
   );
 }
 
+function TenantPortal({ token }) {
+  const [data, setData] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [form, setForm] = useState({ provider: 'mpesa', transaction_ref: '', evidence_url: '' });
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+
+  function load() {
+    setError('');
+    return request('/tenant/me', { token }).then(setData).catch(e => setError(e.message));
+  }
+
+  useEffect(() => {
+    load();
+  }, [token]);
+
+  async function upload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const body = new FormData();
+    body.append('file', file);
+    const out = await request('/tenant/uploads', { method: 'POST', body, token }).catch(e => setError(e.message));
+    if (out) {
+      setForm(current => ({ ...current, evidence_url: out.url }));
+      setNotice('Screenshot uploaded.');
+    }
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!selected) {
+      setError('Select a payment first.');
+      return;
+    }
+    const body = { ...form, payment_intent_id: selected.id, amount_cents: selected.amount_cents };
+    const out = await request('/tenant/payments/mark-paid', { method: 'POST', body: JSON.stringify(body), token }).catch(e => setError(e.message));
+    if (out) {
+      setNotice('Payment submitted for landlord verification.');
+      setForm({ provider: 'mpesa', transaction_ref: '', evidence_url: '' });
+      setSelected(null);
+      load();
+    }
+  }
+
+  return (
+    <main className="tenantPortal">
+      <section className="tenantHero">
+        <strong className="brand">RentPulse</strong>
+        <h1>{data ? `Hello, ${data.full_name}` : 'Tenant payment portal'}</h1>
+        <p>Upload payment evidence and transaction references directly to your landlord. Your landlord still verifies the record before it is marked collected.</p>
+      </section>
+      {error && <p className="error">{error}</p>}{notice && <p className="notice">{notice}</p>}
+      <section className="tenantGrid">
+        <div className="panel">
+          <h2>Open payments</h2>
+          {!data ? <p>Loading...</p> : data.payments.length === 0 ? <Empty title="No open payments" text="There are no due or overdue rent items assigned to this portal link." /> : data.payments.map(payment => (
+            <button key={payment.id} className={selected?.id === payment.id ? 'paymentChoice selected' : 'paymentChoice'} onClick={() => setSelected(payment)}>
+              <span>{payment.property_name} {payment.unit_label}</span>
+              <strong>{kes(payment.amount_cents)}</strong>
+              <small>Due {new Date(payment.due_on).toLocaleDateString()} · {payment.status}</small>
+            </button>
+          ))}
+        </div>
+        <form className="panel tenantForm" onSubmit={submit}>
+          <h2>Submit proof</h2>
+          <label>Payment method<input value={form.provider} onChange={e => setForm({ ...form, provider: e.target.value })} /></label>
+          <label>Transaction code<input value={form.transaction_ref} onChange={e => setForm({ ...form, transaction_ref: e.target.value })} placeholder="e.g. RKP82LL09S" /></label>
+          <label className="btn ghost uploadButton"><Upload size={18} />Upload screenshot or PDF<input type="file" accept=".jpg,.jpeg,.png,.pdf" hidden onChange={upload} /></label>
+          {form.evidence_url && <a className="evidenceLink" href={form.evidence_url} target="_blank">Evidence uploaded</a>}
+          <button className="btn primary">Submit for verification</button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
 function Pricing({ publicMode = false }) {
   const [plans, setPlans] = useState([]);
-  useEffect(() => { request('/plans').then(setPlans).catch(() => setPlans([])); }, []);
+  useEffect(() => { request('/plans').then(data => setPlans(Array.isArray(data) ? data : [])).catch(() => setPlans([])); }, []);
   return (
     <Page title={publicMode ? 'Plans that match your portfolio' : 'Pricing'} subtitle={publicMode ? '' : 'Plan data is served by the backend.'}>
       <div className="plans">{plans.map(plan => <article className={plan.id === 'pro' ? 'plan popular' : 'plan'} key={plan.id}><span className="pill">{plan.name}</span><h2>{plan.price_cents === null ? 'Custom' : kes(plan.price_cents)}<small>{plan.price_cents === null ? '' : '/mo'}</small></h2><p>{plan.unit_limit ? `Up to ${plan.unit_limit} units` : 'Unlimited units'}</p>{plan.features.map(f => <div className="check" key={f}><CheckCircle2 size={17} />{f}</div>)}</article>)}</div>

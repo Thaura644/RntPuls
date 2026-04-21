@@ -15,6 +15,8 @@ type Config struct {
 	MPesaConsumerKey string
 	MPesaSecret      string
 	MPesaShortCode   string
+	UploadDir        string
+	PublicBaseURL    string
 }
 
 func Load() Config {
@@ -31,6 +33,8 @@ func Load() Config {
 		MPesaConsumerKey: env("MPESA_CONSUMER_KEY", ""),
 		MPesaSecret:      env("MPESA_CONSUMER_SECRET", ""),
 		MPesaShortCode:   env("MPESA_SHORT_CODE", ""),
+		UploadDir:        env("UPLOAD_DIR", "uploads"),
+		PublicBaseURL:    env("PUBLIC_BASE_URL", "http://localhost:8080"),
 	}
 }
 
