@@ -204,7 +204,7 @@ function Dashboard() {
   if (!data) return <Page title="Dashboard"><p>Loading live portfolio...</p></Page>;
   const pct = data.total_due_cents ? Math.round((data.collected_cents / data.total_due_cents) * 100) : 0;
   return (
-    <Page title="Collection command center" subtitle="Live values from your ledger for the current month.">
+    <Page title="Collections" subtitle="Live values from your ledger for the current month.">
       <div className="stats">
         <Stat label="Total due" value={kes(data.total_due_cents)} />
         <Stat label="Collected" value={kes(data.collected_cents)} tone="green" />
@@ -340,7 +340,12 @@ const importFields = [
   ['monthly_rent_kes', 'Monthly rent KES', false],
   ['lease_start_date', 'Lease start date', false],
   ['due_day', 'Rent due day', false],
-  ['deposit_kes', 'Deposit KES', false]
+  ['deposit_kes', 'Deposit KES', false],
+  ['payment_method', 'Payment method', false],
+  ['bank_name', 'Bank name', false],
+  ['bank_account_number', 'Bank account number', false],
+  ['mpesa_paybill', 'M-Pesa paybill', false],
+  ['mpesa_account_number', 'M-Pesa account number', false]
 ];
 
 function ImportWizard({ onClose, onImported }) {

@@ -348,7 +348,8 @@ func (a *App) createUnit(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listTenants(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	rows, err := a.db.Query(r.Context(), `SELECT t.id::text AS id, t.full_name, t.phone, t.email,
+	rows, err := a.db.Query(r.Context(), `SELECT t.id::text AS id, t.full_name, t.phone, t.email, t.national_id,
+			t.payment_method, t.bank_name, t.bank_account_number, t.mpesa_paybill, t.mpesa_account_number,
 			COALESCE(p.id::text,'') AS property_id, COALESCE(p.name,'') AS property_name,
 			COALESCE(un.id::text,'') AS unit_id, COALESCE(un.label,'') AS unit_label,
 			COALESCE(l.rent_cents,0) AS rent_cents, COALESCE(l.status,'') AS lease_status, t.created_at
@@ -368,15 +369,20 @@ func (a *App) listTenants(w http.ResponseWriter, r *http.Request) {
 func (a *App) createTenant(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	var in struct {
-		FullName     string `json:"full_name"`
-		Phone        string `json:"phone"`
-		Email        string `json:"email"`
-		NationalID   string `json:"national_id"`
-		UnitID       string `json:"unit_id"`
-		StartsOn     string `json:"starts_on"`
-		DueDay       int    `json:"due_day"`
-		RentCents    int64  `json:"rent_cents"`
-		DepositCents int64  `json:"deposit_cents"`
+		FullName           string `json:"full_name"`
+		Phone              string `json:"phone"`
+		Email              string `json:"email"`
+		NationalID         string `json:"national_id"`
+		PaymentMethod      string `json:"payment_method"`
+		BankName           string `json:"bank_name"`
+		BankAccountNumber  string `json:"bank_account_number"`
+		MPesaPaybill       string `json:"mpesa_paybill"`
+		MPesaAccountNumber string `json:"mpesa_account_number"`
+		UnitID             string `json:"unit_id"`
+		StartsOn           string `json:"starts_on"`
+		DueDay             int    `json:"due_day"`
+		RentCents          int64  `json:"rent_cents"`
+		DepositCents       int64  `json:"deposit_cents"`
 	}
 	if !decode(w, r, &in) || in.FullName == "" || in.Phone == "" {
 		writeError(w, http.StatusBadRequest, "tenant name and phone are required")
@@ -385,7 +391,7 @@ func (a *App) createTenant(w http.ResponseWriter, r *http.Request) {
 	tx, _ := a.db.Begin(r.Context())
 	defer tx.Rollback(r.Context())
 	var tenantID string
-	if err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id) VALUES ($1,$2,$3,$4,$5) RETURNING id`, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID).Scan(&tenantID); err != nil {
+	if err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id,payment_method,bank_name,bank_account_number,mpesa_paybill,mpesa_account_number) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID, in.PaymentMethod, in.BankName, in.BankAccountNumber, in.MPesaPaybill, in.MPesaAccountNumber).Scan(&tenantID); err != nil {
 		writeError(w, http.StatusInternalServerError, "tenant create failed")
 		return
 	}
@@ -413,13 +419,18 @@ func (a *App) updateTenant(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	tenantID := r.PathValue("tenantID")
 	var in struct {
-		FullName   string `json:"full_name"`
-		Phone      string `json:"phone"`
-		Email      string `json:"email"`
-		NationalID string `json:"national_id"`
-		UnitID     string `json:"unit_id"`
-		DueDay     int    `json:"due_day"`
-		RentCents  int64  `json:"rent_cents"`
+		FullName           string `json:"full_name"`
+		Phone              string `json:"phone"`
+		Email              string `json:"email"`
+		NationalID         string `json:"national_id"`
+		PaymentMethod      string `json:"payment_method"`
+		BankName           string `json:"bank_name"`
+		BankAccountNumber  string `json:"bank_account_number"`
+		MPesaPaybill       string `json:"mpesa_paybill"`
+		MPesaAccountNumber string `json:"mpesa_account_number"`
+		UnitID             string `json:"unit_id"`
+		DueDay             int    `json:"due_day"`
+		RentCents          int64  `json:"rent_cents"`
 	}
 	if !decode(w, r, &in) || tenantID == "" || in.FullName == "" || in.Phone == "" {
 		writeError(w, http.StatusBadRequest, "tenant id, name and phone are required")
@@ -431,7 +442,7 @@ func (a *App) updateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	tag, err := tx.Exec(r.Context(), `UPDATE tenants SET full_name=$3, phone=$4, email=$5, national_id=$6 WHERE id=$1 AND organization_id=$2`, tenantID, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID)
+	tag, err := tx.Exec(r.Context(), `UPDATE tenants SET full_name=$3, phone=$4, email=$5, national_id=$6, payment_method=$7, bank_name=$8, bank_account_number=$9, mpesa_paybill=$10, mpesa_account_number=$11 WHERE id=$1 AND organization_id=$2`, tenantID, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID, in.PaymentMethod, in.BankName, in.BankAccountNumber, in.MPesaPaybill, in.MPesaAccountNumber)
 	if err != nil || tag.RowsAffected() == 0 {
 		writeError(w, http.StatusNotFound, "tenant not found")
 		return
@@ -497,7 +508,7 @@ func (a *App) tenantImportTemplate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-tenant-import-template.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"full_name", "phone", "email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes"})
+	_ = cw.Write([]string{"full_name", "phone", "email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes", "payment_method", "bank_name", "bank_account_number", "mpesa_paybill", "mpesa_account_number"})
 	cw.Flush()
 }
 
@@ -522,7 +533,7 @@ func (a *App) previewTenantImport(w http.ResponseWriter, r *http.Request) {
 		"total_rows":        len(table.Rows),
 		"suggested_mapping": mapping,
 		"required_fields":   []string{"full_name", "phone"},
-		"optional_fields":   []string{"email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes"},
+		"optional_fields":   []string{"email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes", "payment_method", "bank_name", "bank_account_number", "mpesa_paybill", "mpesa_account_number"},
 		"validation":        result,
 	})
 }
@@ -577,7 +588,7 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		var tenantID string
-		err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id) VALUES ($1,$2,$3,$4,$5) RETURNING id`, u.OrganizationID, rec.FullName, rec.Phone, rec.Email, rec.NationalID).Scan(&tenantID)
+		err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id,payment_method,bank_name,bank_account_number,mpesa_paybill,mpesa_account_number) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, u.OrganizationID, rec.FullName, rec.Phone, rec.Email, rec.NationalID, rec.PaymentMethod, rec.BankName, rec.BankAccountNumber, rec.MPesaPaybill, rec.MPesaAccountNumber).Scan(&tenantID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("row %d: %v", i+2, err))
 			continue
@@ -621,7 +632,7 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) exportTenantsCSV(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	rows, err := a.db.Query(r.Context(), `SELECT full_name, phone, email, national_id, created_at FROM tenants WHERE organization_id=$1 ORDER BY full_name`, u.OrganizationID)
+	rows, err := a.db.Query(r.Context(), `SELECT full_name, phone, email, national_id, payment_method, bank_name, bank_account_number, mpesa_paybill, mpesa_account_number, created_at FROM tenants WHERE organization_id=$1 ORDER BY full_name`, u.OrganizationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "export failed")
 		return
@@ -630,12 +641,12 @@ func (a *App) exportTenantsCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-tenants.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"Full name", "Phone", "Email", "National ID", "Created at"})
+	_ = cw.Write([]string{"Full name", "Phone", "Email", "National ID", "Payment method", "Bank name", "Bank account number", "M-Pesa paybill", "M-Pesa account number", "Created at"})
 	for rows.Next() {
-		var name, phone, email, nid string
+		var name, phone, email, nid, paymentMethod, bankName, bankAccountNumber, mpesaPaybill, mpesaAccountNumber string
 		var created time.Time
-		_ = rows.Scan(&name, &phone, &email, &nid, &created)
-		_ = cw.Write([]string{name, phone, email, nid, created.Format(time.RFC3339)})
+		_ = rows.Scan(&name, &phone, &email, &nid, &paymentMethod, &bankName, &bankAccountNumber, &mpesaPaybill, &mpesaAccountNumber, &created)
+		_ = cw.Write([]string{name, phone, email, nid, paymentMethod, bankName, bankAccountNumber, mpesaPaybill, mpesaAccountNumber, created.Format(time.RFC3339)})
 	}
 	cw.Flush()
 }
@@ -1086,18 +1097,23 @@ type importTable struct {
 }
 
 type tenantImport struct {
-	FullName         string
-	Phone            string
-	Email            string
-	NationalID       string
-	PropertyName     string
-	PropertyAddress  string
-	City             string
-	UnitLabel        string
-	MonthlyRentCents int64
-	LeaseStartDate   string
-	DueDay           int
-	DepositCents     int64
+	FullName           string
+	Phone              string
+	Email              string
+	NationalID         string
+	PropertyName       string
+	PropertyAddress    string
+	City               string
+	UnitLabel          string
+	MonthlyRentCents   int64
+	LeaseStartDate     string
+	DueDay             int
+	DepositCents       int64
+	PaymentMethod      string
+	BankName           string
+	BankAccountNumber  string
+	MPesaPaybill       string
+	MPesaAccountNumber string
 }
 
 type importValidation struct {
@@ -1158,18 +1174,23 @@ func readImportTable(file multipart.File, header *multipart.FileHeader) (importT
 
 func suggestTenantMapping(headers []string) map[string]string {
 	aliases := map[string][]string{
-		"full_name":        {"full_name", "full name", "tenant", "tenant name", "name", "resident", "resident name"},
-		"phone":            {"phone", "phone number", "mobile", "mobile number", "msisdn", "contact", "contact phone"},
-		"email":            {"email", "email address", "mail"},
-		"national_id":      {"national_id", "national id", "id number", "id", "passport"},
-		"property_name":    {"property_name", "property name", "property", "building", "estate", "apartment"},
-		"property_address": {"property_address", "property address", "address", "location"},
-		"city":             {"city", "town"},
-		"unit_label":       {"unit_label", "unit label", "unit", "unit no", "unit number", "house", "house number", "door"},
-		"monthly_rent_kes": {"monthly_rent_kes", "monthly rent", "rent", "rent amount", "amount", "monthly_rent"},
-		"lease_start_date": {"lease_start_date", "lease start", "start date", "starts on", "move in", "move-in date"},
-		"due_day":          {"due_day", "due day", "rent due day", "due"},
-		"deposit_kes":      {"deposit_kes", "deposit", "security deposit"},
+		"full_name":            {"full_name", "full name", "tenant", "tenant name", "name", "resident", "resident name"},
+		"phone":                {"phone", "phone number", "mobile", "mobile number", "msisdn", "contact", "contact phone"},
+		"email":                {"email", "email address", "mail"},
+		"national_id":          {"national_id", "national id", "id number", "id", "passport"},
+		"property_name":        {"property_name", "property name", "property", "building", "estate", "apartment"},
+		"property_address":     {"property_address", "property address", "address", "location"},
+		"city":                 {"city", "town"},
+		"unit_label":           {"unit_label", "unit label", "unit", "unit no", "unit number", "house", "house number", "door"},
+		"monthly_rent_kes":     {"monthly_rent_kes", "monthly rent", "rent", "rent amount", "amount", "monthly_rent"},
+		"lease_start_date":     {"lease_start_date", "lease start", "start date", "starts on", "move in", "move-in date"},
+		"due_day":              {"due_day", "due day", "rent due day", "due"},
+		"deposit_kes":          {"deposit_kes", "deposit", "security deposit"},
+		"payment_method":       {"payment_method", "payment method", "payment route", "pay via", "mode of payment"},
+		"bank_name":            {"bank_name", "bank name", "bank"},
+		"bank_account_number":  {"bank_account_number", "bank account", "bank account number", "account number"},
+		"mpesa_paybill":        {"mpesa_paybill", "m-pesa paybill", "mpesa paybill", "paybill"},
+		"mpesa_account_number": {"mpesa_account_number", "m-pesa account number", "mpesa account", "mpesa account number", "paybill account"},
 	}
 	mapping := map[string]string{}
 	for field, names := range aliases {
@@ -1238,6 +1259,15 @@ func validateTenantRecord(rec tenantImport) []string {
 	if rec.PropertyName == "" && rec.UnitLabel != "" {
 		errs = append(errs, "property_name is required when unit_label is provided")
 	}
+	if rec.PaymentMethod != "" && rec.PaymentMethod != "bank" && rec.PaymentMethod != "mpesa_paybill" {
+		errs = append(errs, "payment_method must be bank or mpesa_paybill")
+	}
+	if rec.PaymentMethod == "bank" && rec.BankAccountNumber == "" {
+		errs = append(errs, "bank_account_number is required when payment_method is bank")
+	}
+	if rec.PaymentMethod == "mpesa_paybill" && (rec.MPesaPaybill == "" || rec.MPesaAccountNumber == "") {
+		errs = append(errs, "mpesa_paybill and mpesa_account_number are required when payment_method is mpesa_paybill")
+	}
 	return errs
 }
 
@@ -1260,18 +1290,23 @@ func tenantImportRecord(row []string, mapping map[string]string) tenantImport {
 		return strings.TrimSpace(row[index])
 	}
 	return tenantImport{
-		FullName:         get("full_name"),
-		Phone:            get("phone"),
-		Email:            strings.ToLower(get("email")),
-		NationalID:       get("national_id"),
-		PropertyName:     get("property_name"),
-		PropertyAddress:  get("property_address"),
-		City:             get("city"),
-		UnitLabel:        get("unit_label"),
-		MonthlyRentCents: parseKESCents(get("monthly_rent_kes")),
-		LeaseStartDate:   get("lease_start_date"),
-		DueDay:           parseInt(get("due_day")),
-		DepositCents:     parseKESCents(get("deposit_kes")),
+		FullName:           get("full_name"),
+		Phone:              get("phone"),
+		Email:              strings.ToLower(get("email")),
+		NationalID:         get("national_id"),
+		PropertyName:       get("property_name"),
+		PropertyAddress:    get("property_address"),
+		City:               get("city"),
+		UnitLabel:          get("unit_label"),
+		MonthlyRentCents:   parseKESCents(get("monthly_rent_kes")),
+		LeaseStartDate:     get("lease_start_date"),
+		DueDay:             parseInt(get("due_day")),
+		DepositCents:       parseKESCents(get("deposit_kes")),
+		PaymentMethod:      normalizePaymentMethod(get("payment_method")),
+		BankName:           get("bank_name"),
+		BankAccountNumber:  get("bank_account_number"),
+		MPesaPaybill:       get("mpesa_paybill"),
+		MPesaAccountNumber: get("mpesa_account_number"),
 	}
 }
 
@@ -1329,6 +1364,18 @@ func parseInt(value string) int {
 	}
 	n, _ := strconv.Atoi(value)
 	return n
+}
+
+func normalizePaymentMethod(value string) string {
+	value = normalizeHeader(value)
+	switch value {
+	case "bank", "bank transfer", "bank deposit", "transfer":
+		return "bank"
+	case "mpesa", "m pesa", "m pesa paybill", "mpesa paybill", "paybill", "mpesa_paybill":
+		return "mpesa_paybill"
+	default:
+		return value
+	}
 }
 
 func ensureProperty(ctx context.Context, tx pgx.Tx, orgID, name, address, city string) (string, error) {

@@ -10,6 +10,7 @@ RentPulse is a production-oriented rent collection platform for small landlords 
 - Payment marking and landlord verification workflow, with optional M-Pesa transaction-status verification when Daraja credentials are configured.
 - Tenant portal links for tenants to upload screenshots/PDF evidence and submit payment references without landlord account access.
 - Tenant import template CSV plus an import wizard that previews files, maps spreadsheet columns, validates rows, and imports compatible CSV/XLSX files.
+- Sample agency Excel workbooks live in `sample-data/imports/`: one master import workbook and one workbook per property, each with more than 50 units and mixed bank/M-Pesa paybill payment routes.
 - Main app navigation: Dashboard, Tenants, Payments, and Settings. Pricing lives inside Settings.
 - Plan-aware request throttling and unit limits: Free/Starter up to 2 units, Pro up to 10 units, Agency unlimited.
 - SMS reminder execution through Twilio when credentials are configured; skipped sends are recorded when the provider is not configured.

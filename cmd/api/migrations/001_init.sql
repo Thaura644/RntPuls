@@ -46,8 +46,19 @@ CREATE TABLE IF NOT EXISTS tenants (
   phone TEXT NOT NULL,
   email TEXT NOT NULL DEFAULT '',
   national_id TEXT NOT NULL DEFAULT '',
+  payment_method TEXT NOT NULL DEFAULT '',
+  bank_name TEXT NOT NULL DEFAULT '',
+  bank_account_number TEXT NOT NULL DEFAULT '',
+  mpesa_paybill TEXT NOT NULL DEFAULT '',
+  mpesa_account_number TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT '';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS bank_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS bank_account_number TEXT NOT NULL DEFAULT '';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mpesa_paybill TEXT NOT NULL DEFAULT '';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mpesa_account_number TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS leases (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
