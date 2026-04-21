@@ -56,7 +56,7 @@ function App() {
       <Shell route={route} setRoute={setRoute} user={user} logout={logout}>
         {route === 'dashboard' && <Dashboard />}
         {route === 'tenants' && <Tenants />}
-        {route === 'pricing' && <Pricing />}
+        {route === 'payments' && <Payments />}
         {route === 'settings' && <SettingsPage />}
       </Shell>
     </ErrorBoundary>
@@ -175,7 +175,7 @@ function Shell({ children, route, setRoute, user, logout }) {
   const nav = [
     ['dashboard', Home, 'Dashboard'],
     ['tenants', Users, 'Tenants'],
-    ['pricing', WalletCards, 'Pricing'],
+    ['payments', WalletCards, 'Payments'],
     ['settings', Settings, 'Settings']
   ];
   return (
@@ -225,6 +225,7 @@ function Tenants() {
   const [form, setForm] = useState({ full_name: '', phone: '', email: '' });
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [importOpen, setImportOpen] = useState(false);
   const load = () => {
     setError('');
     return request('/tenants')
@@ -238,14 +239,6 @@ function Tenants() {
     e.preventDefault();
     setError('');
     await request('/tenants', { method: 'POST', body: JSON.stringify(form) }).then(() => { setForm({ full_name: '', phone: '', email: '' }); load(); }).catch(e => setError(e.message));
-  }
-  async function upload(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    const body = new FormData();
-    body.append('file', file);
-    const out = await request('/imports/tenants', { method: 'POST', body }).catch(e => setError(e.message));
-    if (out) { setNotice(`Imported ${out.imported_rows} of ${out.total_rows} rows`); load(); }
   }
   async function copyTenantLink(tenantID) {
     setError('');
@@ -263,7 +256,8 @@ function Tenants() {
         <button className="btn primary"><Plus size={18} />Add</button>
       </form>
       <div className="toolbar">
-        <label className="btn ghost"><Upload size={18} />Import<input type="file" accept=".csv,.xlsx" onChange={upload} hidden /></label>
+        <a className="btn ghost" href={`${API}/imports/tenants/template.csv`} onClick={(e) => attachTokenDownload(e, '/imports/tenants/template.csv', 'rentpulse-tenant-import-template.csv')}><Download size={18} />Template CSV</a>
+        <button className="btn ghost" type="button" onClick={() => setImportOpen(true)}><Upload size={18} />Import wizard</button>
         <a className="btn ghost" href={`${API}/exports/tenants.csv`} onClick={(e) => attachTokenDownload(e, '/exports/tenants.csv')}><Download size={18} />Export CSV</a>
         <a className="btn ghost" href={`${API}/reports/monthly.xlsx`} onClick={(e) => attachTokenDownload(e, '/reports/monthly.xlsx')}><FileSpreadsheet size={18} />Excel report</a>
       </div>
@@ -271,7 +265,112 @@ function Tenants() {
       <section className="panel tablePanel">
         {tenants.length === 0 ? <Empty title="No tenants yet" text="Create or import tenants to populate your ledger." /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th><th>Tenant access</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td>{t.full_name}</td><td>{t.phone}</td><td>{t.email}</td><td>{t.property_name}</td><td>{t.unit_label}</td><td>{kes(t.rent_cents || 0)}</td><td><button className="linkButton" onClick={() => copyTenantLink(t.id)}>Copy link</button></td></tr>)}</tbody></table>}
       </section>
+      {importOpen && <ImportWizard onClose={() => setImportOpen(false)} onImported={(summary) => { setNotice(`Imported ${summary.imported_rows} of ${summary.total_rows} rows`); setImportOpen(false); load(); }} />}
     </Page>
+  );
+}
+
+const importFields = [
+  ['full_name', 'Tenant full name', true],
+  ['phone', 'Phone number', true],
+  ['email', 'Email', false],
+  ['national_id', 'National ID', false],
+  ['property_name', 'Property name', false],
+  ['property_address', 'Property address', false],
+  ['city', 'City', false],
+  ['unit_label', 'Unit label', false],
+  ['monthly_rent_kes', 'Monthly rent KES', false],
+  ['lease_start_date', 'Lease start date', false],
+  ['due_day', 'Rent due day', false],
+  ['deposit_kes', 'Deposit KES', false]
+];
+
+function ImportWizard({ onClose, onImported }) {
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [mapping, setMapping] = useState({});
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function previewFile(nextFile) {
+    if (!nextFile) return;
+    setFile(nextFile);
+    setPreview(null);
+    setError('');
+    setBusy(true);
+    const body = new FormData();
+    body.append('file', nextFile);
+    const out = await request('/imports/tenants/preview', { method: 'POST', body }).catch(e => setError(e.message));
+    if (out) {
+      setPreview(out);
+      setMapping(out.suggested_mapping || {});
+    }
+    setBusy(false);
+  }
+
+  async function runImport() {
+    if (!file) {
+      setError('Choose a CSV or XLSX file first.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    const body = new FormData();
+    body.append('file', file);
+    body.append('mapping', JSON.stringify(mapping));
+    const out = await request('/imports/tenants', { method: 'POST', body }).catch(e => setError(e.message));
+    setBusy(false);
+    if (out) onImported(out);
+  }
+
+  const validation = preview?.validation;
+  return (
+    <div className="modalBackdrop">
+      <section className="importModal">
+        <div className="modalHead">
+          <div><h2>Tenant import wizard</h2><p>Upload a CSV or XLSX file, match columns, test the mapping, then import.</p></div>
+          <button className="linkButton" onClick={onClose}>Close</button>
+        </div>
+        <div className="importSteps">
+          <label className="dropZone">
+            <Upload size={24} />
+            <strong>{file ? file.name : 'Choose tenant file'}</strong>
+            <span>CSV or XLSX with a header row</span>
+            <input type="file" accept=".csv,.xlsx" hidden onChange={(e) => previewFile(e.target.files[0])} />
+          </label>
+          {preview && (
+            <>
+              <div className="mappingGrid">
+                {importFields.map(([field, label, required]) => (
+                  <label key={field}>
+                    <span>{label}{required ? ' *' : ''}</span>
+                    <select value={mapping[field] || ''} onChange={(e) => setMapping({ ...mapping, [field]: e.target.value })}>
+                      <option value="">Do not import</option>
+                      {preview.headers.map(header => <option key={header} value={header}>{header}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+              <div className="validationBox">
+                <strong>{validation.valid_rows} valid sample row(s), {validation.invalid_rows} invalid sample row(s)</strong>
+                {validation.errors.slice(0, 6).map(err => <p className="error" key={err}>{err}</p>)}
+              </div>
+              <div className="previewTable">
+                <table>
+                  <thead><tr>{preview.headers.map(header => <th key={header}>{header}</th>)}</tr></thead>
+                  <tbody>{preview.sample_rows.map((row, i) => <tr key={i}>{preview.headers.map((header, idx) => <td key={header}>{row[idx]}</td>)}</tr>)}</tbody>
+                </table>
+              </div>
+            </>
+          )}
+          {error && <p className="error">{error}</p>}
+          <div className="toolbar">
+            <button className="btn primary" type="button" onClick={runImport} disabled={busy || !preview}>{busy ? 'Working...' : 'Import tenants'}</button>
+            <a className="btn ghost" href={`${API}/imports/tenants/template.csv`} onClick={(e) => attachTokenDownload(e, '/imports/tenants/template.csv', 'rentpulse-tenant-import-template.csv')}>Download template</a>
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -351,6 +450,37 @@ function TenantPortal({ token }) {
   );
 }
 
+function Payments() {
+  const [payments, setPayments] = useState([]);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    request('/payments').then(data => setPayments(Array.isArray(data) ? data : [])).catch(e => setError(e.message));
+  }, []);
+  return (
+    <Page title="Payments" subtitle="Track due, overdue, submitted, and verified rent payments from the live ledger.">
+      {error && <p className="error">{error}</p>}
+      <section className="panel tablePanel">
+        {payments.length === 0 ? <Empty title="No payments yet" text="Payment items are created when active leases exist for the current month." /> : (
+          <table>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Due on</th><th>Amount</th><th>Status</th><th>Reference</th><th>Evidence</th></tr></thead>
+            <tbody>{payments.map(payment => (
+              <tr key={payment.id}>
+                <td>{payment.tenant_name}<br /><small>{payment.tenant_phone}</small></td>
+                <td>{payment.property_name} {payment.unit_label}</td>
+                <td>{payment.due_on ? new Date(payment.due_on).toLocaleDateString() : ''}</td>
+                <td>{kes(payment.amount_cents || 0)}</td>
+                <td><span className={`status ${payment.status}`}>{payment.status}</span></td>
+                <td>{payment.transaction_ref}</td>
+                <td>{payment.evidence_url ? <a className="evidenceLink" href={payment.evidence_url} target="_blank">Open</a> : ''}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
+      </section>
+    </Page>
+  );
+}
+
 function Pricing({ publicMode = false }) {
   const [plans, setPlans] = useState([]);
   useEffect(() => { request('/plans').then(data => setPlans(Array.isArray(data) ? data : [])).catch(() => setPlans([])); }, []);
@@ -365,6 +495,7 @@ function SettingsPage() {
   const [form, setForm] = useState(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const [tab, setTab] = useState('general');
   useEffect(() => { request('/settings').then(setForm).catch(e => setError(e.message)); }, []);
   async function save(e) {
     e.preventDefault();
@@ -377,18 +508,83 @@ function SettingsPage() {
   }
   if (!form) return <Page title="Settings"><p>{error || 'Loading settings...'}</p></Page>;
   return (
-    <Page title="Settings" subtitle="Configure payment details and communication templates used by the reminder algorithm.">
-      <form className="settingsForm" onSubmit={save}>
-        <label>M-Pesa Paybill<input value={form.mpesa_paybill} onChange={e => setForm({ ...form, mpesa_paybill: e.target.value })} /></label>
-        <label>M-Pesa Till<input value={form.mpesa_till} onChange={e => setForm({ ...form, mpesa_till: e.target.value })} /></label>
-        <label>SMS sender ID<input value={form.sms_sender_id} onChange={e => setForm({ ...form, sms_sender_id: e.target.value })} /></label>
-        <label>Reminder before days<input type="number" value={form.reminder_before_days} onChange={e => setForm({ ...form, reminder_before_days: Number(e.target.value) })} /></label>
-        <label>Reminder template<textarea value={form.reminder_template} onChange={e => setForm({ ...form, reminder_template: e.target.value })} /></label>
-        <label>Escalation template<textarea value={form.escalation_template} onChange={e => setForm({ ...form, escalation_template: e.target.value })} /></label>
-        <div className="toolbar"><button className="btn primary">Save settings</button><button type="button" className="btn ghost" onClick={reminders}><MessageSquareText size={18} />Run reminders</button></div>
-      </form>
+    <Page title="Settings" subtitle={`Current plan: ${form.plan}. Configure operations, properties, units, and billing.`}>
+      <div className="tabs">
+        {['general', 'properties', 'pricing'].map(id => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{id}</button>)}
+      </div>
+      {tab === 'general' && (
+        <form className="settingsForm" onSubmit={save}>
+          <label>M-Pesa Paybill<input value={form.mpesa_paybill} onChange={e => setForm({ ...form, mpesa_paybill: e.target.value })} /></label>
+          <label>M-Pesa Till<input value={form.mpesa_till} onChange={e => setForm({ ...form, mpesa_till: e.target.value })} /></label>
+          <label>SMS sender ID<input value={form.sms_sender_id} onChange={e => setForm({ ...form, sms_sender_id: e.target.value })} /></label>
+          <label>Reminder before days<input type="number" value={form.reminder_before_days} onChange={e => setForm({ ...form, reminder_before_days: Number(e.target.value) })} /></label>
+          <label>Reminder template<textarea value={form.reminder_template} onChange={e => setForm({ ...form, reminder_template: e.target.value })} /></label>
+          <label>Escalation template<textarea value={form.escalation_template} onChange={e => setForm({ ...form, escalation_template: e.target.value })} /></label>
+          <div className="toolbar"><button className="btn primary">Save settings</button><button type="button" className="btn ghost" onClick={reminders}><MessageSquareText size={18} />Run reminders</button></div>
+        </form>
+      )}
+      {tab === 'properties' && <PropertyManager />}
+      {tab === 'pricing' && <Pricing publicMode />}
       {notice && <p className="notice">{notice}</p>}{error && <p className="error">{error}</p>}
     </Page>
+  );
+}
+
+function PropertyManager() {
+  const [properties, setProperties] = useState([]);
+  const [units, setUnits] = useState([]);
+  const [propertyForm, setPropertyForm] = useState({ name: '', address: '', city: '' });
+  const [unitForm, setUnitForm] = useState({ property_id: '', label: '', rent_cents: '' });
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const load = () => {
+    request('/properties').then(data => setProperties(Array.isArray(data) ? data : [])).catch(e => setError(e.message));
+    request('/units').then(data => setUnits(Array.isArray(data) ? data : [])).catch(e => setError(e.message));
+  };
+  useEffect(load, []);
+  async function createProperty(e) {
+    e.preventDefault();
+    setError('');
+    const out = await request('/properties', { method: 'POST', body: JSON.stringify({ ...propertyForm, units: [] }) }).catch(e => setError(e.message));
+    if (out) {
+      setNotice('Property created');
+      setPropertyForm({ name: '', address: '', city: '' });
+      load();
+    }
+  }
+  async function createUnit(e) {
+    e.preventDefault();
+    setError('');
+    const out = await request('/units', { method: 'POST', body: JSON.stringify({ ...unitForm, rent_cents: Math.round(Number(unitForm.rent_cents) * 100) }) }).catch(e => setError(e.message));
+    if (out) {
+      setNotice('Unit created');
+      setUnitForm({ property_id: '', label: '', rent_cents: '' });
+      load();
+    }
+  }
+  return (
+    <section className="settingsSplit">
+      <form className="panel tenantForm" onSubmit={createProperty}>
+        <h2>Properties</h2>
+        <label>Name<input value={propertyForm.name} onChange={e => setPropertyForm({ ...propertyForm, name: e.target.value })} /></label>
+        <label>Address<input value={propertyForm.address} onChange={e => setPropertyForm({ ...propertyForm, address: e.target.value })} /></label>
+        <label>City<input value={propertyForm.city} onChange={e => setPropertyForm({ ...propertyForm, city: e.target.value })} /></label>
+        <button className="btn primary">Add property</button>
+      </form>
+      <form className="panel tenantForm" onSubmit={createUnit}>
+        <h2>Units</h2>
+        <label>Property<select value={unitForm.property_id} onChange={e => setUnitForm({ ...unitForm, property_id: e.target.value })}><option value="">Choose property</option>{properties.map(property => <option key={property.id} value={property.id}>{property.name}</option>)}</select></label>
+        <label>Unit label<input value={unitForm.label} onChange={e => setUnitForm({ ...unitForm, label: e.target.value })} /></label>
+        <label>Monthly rent KES<input type="number" value={unitForm.rent_cents} onChange={e => setUnitForm({ ...unitForm, rent_cents: e.target.value })} /></label>
+        <button className="btn primary">Add unit</button>
+      </form>
+      <section className="panel tablePanel settingsWide">
+        {error && <p className="error">{error}</p>}{notice && <p className="notice">{notice}</p>}
+        {units.length === 0 ? <Empty title="No units yet" text="Add properties and units here, or create them through the import wizard." /> : (
+          <table><thead><tr><th>Property</th><th>Unit</th><th>Rent</th><th>Status</th></tr></thead><tbody>{units.map(unit => <tr key={unit.id}><td>{unit.property_name}</td><td>{unit.label}</td><td>{kes(unit.monthly_rent_cents || 0)}</td><td>{unit.status}</td></tr>)}</tbody></table>
+        )}
+      </section>
+    </section>
   );
 }
 
@@ -408,13 +604,13 @@ function kes(cents) {
   return `KES ${Number(cents / 100).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-async function attachTokenDownload(e, path) {
+async function attachTokenDownload(e, path, filename) {
   e.preventDefault();
   const blob = await request(path);
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = path.endsWith('.xlsx') ? 'rentpulse-monthly-report.xlsx' : 'rentpulse-tenants.csv';
+  a.download = filename || (path.endsWith('.xlsx') ? 'rentpulse-monthly-report.xlsx' : 'rentpulse-tenants.csv');
   a.click();
   URL.revokeObjectURL(url);
 }

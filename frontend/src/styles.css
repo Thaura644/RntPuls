@@ -42,8 +42,10 @@ footer { padding: 2rem 5vw; background: #0b1c30; color: rgba(255,255,255,.7); }
 .authCard { width: min(460px, 100%); display: grid; gap: .9rem; }
 .authCard h1 { margin: .2rem 0 1rem; font-size: 2.4rem; letter-spacing: -.04em; }
 input, textarea { width: 100%; border: 1px solid rgba(108,122,113,.25); background: white; border-radius: 8px; padding: .9rem 1rem; outline: none; }
+select { width: 100%; border: 1px solid rgba(108,122,113,.25); background: white; border-radius: 8px; padding: .85rem 1rem; outline: none; }
 textarea { min-height: 120px; resize: vertical; }
 input:focus, textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0,108,73,.08); }
+select:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0,108,73,.08); }
 .linkButton { border: 0; background: transparent; color: var(--primary); font-weight: 800; cursor: pointer; }
 .app { display: grid; grid-template-columns: 288px minmax(0, 1fr); min-height: 100vh; }
 .sidebar { position: sticky; top: 0; height: 100vh; background: white; padding: 2rem 1.4rem; display: flex; flex-direction: column; gap: 2rem; box-shadow: 18px 0 40px rgba(11,28,48,.04); }
@@ -85,6 +87,15 @@ th { font-size: .72rem; text-transform: uppercase; letter-spacing: .09em; color:
 .settingsForm label:nth-last-child(-n+3), .settingsForm .toolbar { grid-column: 1 / -1; }
 .error { color: var(--danger); font-weight: 800; }
 .notice { color: var(--primary); font-weight: 800; }
+.tabs { display: inline-flex; gap: .4rem; background: white; border: 1px solid rgba(187,202,191,.28); border-radius: 10px; padding: .35rem; margin-bottom: 1rem; }
+.tabs button { border: 0; background: transparent; border-radius: 7px; padding: .7rem 1rem; font-weight: 900; text-transform: capitalize; cursor: pointer; color: rgba(11,28,48,.62); }
+.tabs button.active { background: var(--primary); color: white; }
+.settingsSplit { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1rem; }
+.settingsWide { grid-column: 1 / -1; }
+.status { display: inline-flex; border-radius: 999px; padding: .35rem .6rem; background: var(--low); color: #3c4a42; font-size: .74rem; font-weight: 900; text-transform: uppercase; }
+.status.verified { background: rgba(16,185,129,.15); color: var(--primary); }
+.status.overdue, .status.rejected { background: rgba(186,26,26,.12); color: var(--danger); }
+.status.tenant_marked_paid { background: rgba(86,94,116,.15); color: #565e74; }
 .tenantPortal { min-height: 100vh; padding: 3rem 5vw; background: var(--surface); }
 .tenantHero { max-width: 900px; margin-bottom: 2rem; }
 .tenantHero h1 { font-size: clamp(2.4rem, 6vw, 5rem); line-height: 1; letter-spacing: -.055em; margin: 1rem 0; }
@@ -98,10 +109,26 @@ th { font-size: .72rem; text-transform: uppercase; letter-spacing: .09em; color:
 .tenantForm label:not(.uploadButton) { display: grid; gap: .45rem; font-weight: 800; color: rgba(11,28,48,.7); }
 .uploadButton { width: 100%; }
 .evidenceLink { color: var(--primary); font-weight: 900; }
+.modalBackdrop { position: fixed; inset: 0; z-index: 80; background: rgba(11,28,48,.42); display: grid; place-items: center; padding: 1.5rem; }
+.importModal { width: min(1120px, 100%); max-height: 90vh; overflow: auto; background: var(--surface); border-radius: 14px; box-shadow: 0 30px 80px rgba(11,28,48,.28); padding: 1.5rem; }
+.modalHead { display: flex; justify-content: space-between; align-items: start; gap: 1rem; margin-bottom: 1rem; }
+.modalHead h2 { margin: 0; font-size: 2rem; letter-spacing: -.04em; }
+.modalHead p { margin: .35rem 0 0; color: #3c4a42; }
+.importSteps { display: grid; gap: 1rem; }
+.dropZone { border: 2px dashed rgba(0,108,73,.28); background: rgba(16,185,129,.08); border-radius: 12px; padding: 1.5rem; display: grid; place-items: center; gap: .35rem; text-align: center; color: var(--primary); cursor: pointer; }
+.dropZone span { color: rgba(11,28,48,.6); font-weight: 700; }
+.mappingGrid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .8rem; }
+.mappingGrid label { display: grid; gap: .35rem; font-weight: 800; color: rgba(11,28,48,.72); }
+.mappingGrid label span { font-size: .82rem; }
+.validationBox { background: white; border: 1px solid rgba(187,202,191,.28); border-radius: 10px; padding: 1rem; }
+.validationBox p { margin: .35rem 0; }
+.previewTable { max-height: 320px; overflow: auto; border: 1px solid rgba(187,202,191,.28); border-radius: 10px; background: white; }
+.previewTable table { min-width: 900px; }
 @media (max-width: 980px) {
   .hero, .app { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; }
-  .featureGrid, .stats, .plans, .inlineForm, .settingsForm, .tenantGrid { grid-template-columns: 1fr; }
+  .featureGrid, .stats, .plans, .inlineForm, .settingsForm, .tenantGrid, .mappingGrid, .settingsSplit { grid-template-columns: 1fr; }
+  .settingsWide { grid-column: auto; }
   .heroMedia { min-height: 430px; }
   .navlinks { display: none; }
   .pageHead { display: block; }

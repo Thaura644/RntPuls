@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Thaura644/RntPuls/internal/config"
@@ -34,6 +35,13 @@ type App struct {
 	cfg    config.Config
 	db     *pgxpool.Pool
 	logger *slog.Logger
+	limits map[string]*rateBucket
+	mu     sync.Mutex
+}
+
+type rateBucket struct {
+	WindowStart time.Time
+	Count       int
 }
 
 type authUser struct {
@@ -50,7 +58,7 @@ type ctxKey string
 const userKey ctxKey = "user"
 
 func New(cfg config.Config, db *pgxpool.Pool, logger *slog.Logger) *App {
-	return &App{cfg: cfg, db: db, logger: logger}
+	return &App{cfg: cfg, db: db, logger: logger, limits: map[string]*rateBucket{}}
 }
 
 func (a *App) Routes() http.Handler {
@@ -65,12 +73,17 @@ func (a *App) Routes() http.Handler {
 	mux.Handle("PUT /api/settings", a.staffAuth(http.HandlerFunc(a.updateSettings)))
 	mux.Handle("GET /api/properties", a.staffAuth(http.HandlerFunc(a.listProperties)))
 	mux.Handle("POST /api/properties", a.staffAuth(http.HandlerFunc(a.createProperty)))
+	mux.Handle("GET /api/units", a.staffAuth(http.HandlerFunc(a.listUnits)))
+	mux.Handle("POST /api/units", a.staffAuth(http.HandlerFunc(a.createUnit)))
 	mux.Handle("GET /api/tenants", a.staffAuth(http.HandlerFunc(a.listTenants)))
 	mux.Handle("POST /api/tenants", a.staffAuth(http.HandlerFunc(a.createTenant)))
 	mux.Handle("POST /api/tenants/{tenantID}/access-link", a.staffAuth(http.HandlerFunc(a.createTenantAccessLink)))
+	mux.Handle("GET /api/imports/tenants/template.csv", a.staffAuth(http.HandlerFunc(a.tenantImportTemplate)))
+	mux.Handle("POST /api/imports/tenants/preview", a.staffAuth(http.HandlerFunc(a.previewTenantImport)))
 	mux.Handle("POST /api/imports/tenants", a.staffAuth(http.HandlerFunc(a.importTenants)))
 	mux.Handle("GET /api/exports/tenants.csv", a.staffAuth(http.HandlerFunc(a.exportTenantsCSV)))
 	mux.Handle("GET /api/reports/monthly.xlsx", a.staffAuth(http.HandlerFunc(a.monthlyExcelReport)))
+	mux.Handle("GET /api/payments", a.staffAuth(http.HandlerFunc(a.listPayments)))
 	mux.Handle("POST /api/payments/mark-paid", a.staffAuth(http.HandlerFunc(a.markPaid)))
 	mux.Handle("POST /api/payments/verify", a.staffAuth(http.HandlerFunc(a.verifyPayment)))
 	mux.Handle("POST /api/communications/reminders/run", a.staffAuth(http.HandlerFunc(a.runReminders)))
@@ -93,10 +106,10 @@ func (a *App) health(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) plans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []map[string]any{
-		{"id": "free", "name": "Free", "price_cents": 0, "unit_limit": 2, "features": []string{"Tenant directory", "Manual payment tracking"}},
-		{"id": "starter", "name": "Starter", "price_cents": 50000, "unit_limit": 2, "features": []string{"Automated invoices", "Basic rent tracking", "CSV exports"}},
-		{"id": "pro", "name": "Pro", "price_cents": 120000, "unit_limit": 10, "features": []string{"WhatsApp/SMS reminders", "M-Pesa verification workflow", "Excel reports", "Imports"}},
-		{"id": "agency", "name": "Agency", "price_cents": nil, "unit_limit": nil, "features": []string{"Unlimited units", "Multi-user access", "Branding", "Priority support"}},
+		{"id": "free", "name": "Free", "price_cents": 0, "unit_limit": 2, "requests_per_minute": 60, "features": []string{"Tenant directory", "Manual payment tracking"}},
+		{"id": "starter", "name": "Starter", "price_cents": 50000, "unit_limit": 2, "requests_per_minute": 120, "features": []string{"Automated invoices", "Basic rent tracking", "CSV exports", "Import wizard"}},
+		{"id": "pro", "name": "Pro", "price_cents": 120000, "unit_limit": 10, "requests_per_minute": 300, "features": []string{"WhatsApp/SMS reminders", "M-Pesa verification workflow", "Excel reports", "Imports"}},
+		{"id": "agency", "name": "Agency", "price_cents": nil, "unit_limit": nil, "requests_per_minute": 1000, "features": []string{"Unlimited units", "Multi-user access", "Branding", "Priority support"}},
 	})
 }
 
@@ -195,7 +208,10 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	row := a.db.QueryRow(r.Context(), `SELECT mpesa_paybill, mpesa_till, sms_sender_id, reminder_before_days, reminder_template, escalation_template FROM organization_settings WHERE organization_id=$1`, u.OrganizationID)
+	row := a.db.QueryRow(r.Context(), `SELECT s.mpesa_paybill, s.mpesa_till, s.sms_sender_id, s.reminder_before_days, s.reminder_template, s.escalation_template, o.plan
+		FROM organization_settings s
+		JOIN organizations o ON o.id=s.organization_id
+		WHERE s.organization_id=$1`, u.OrganizationID)
 	var out struct {
 		MPesaPaybill       string `json:"mpesa_paybill"`
 		MPesaTill          string `json:"mpesa_till"`
@@ -203,8 +219,9 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		ReminderBeforeDays int    `json:"reminder_before_days"`
 		ReminderTemplate   string `json:"reminder_template"`
 		EscalationTemplate string `json:"escalation_template"`
+		Plan               string `json:"plan"`
 	}
-	if err := row.Scan(&out.MPesaPaybill, &out.MPesaTill, &out.SMSSenderID, &out.ReminderBeforeDays, &out.ReminderTemplate, &out.EscalationTemplate); err != nil {
+	if err := row.Scan(&out.MPesaPaybill, &out.MPesaTill, &out.SMSSenderID, &out.ReminderBeforeDays, &out.ReminderTemplate, &out.EscalationTemplate, &out.Plan); err != nil {
 		writeError(w, http.StatusNotFound, "settings not found")
 		return
 	}
@@ -264,6 +281,12 @@ func (a *App) createProperty(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "property name is required")
 		return
 	}
+	if len(in.Units) > 0 {
+		if err := a.enforceUnitCapacity(r.Context(), u.OrganizationID, len(in.Units)); err != nil {
+			writeError(w, http.StatusPaymentRequired, err.Error())
+			return
+		}
+	}
 	tx, _ := a.db.Begin(r.Context())
 	defer tx.Rollback(r.Context())
 	var id string
@@ -278,6 +301,45 @@ func (a *App) createProperty(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "property commit failed")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+func (a *App) listUnits(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	rows, err := a.db.Query(r.Context(), `SELECT un.id, un.label, un.monthly_rent_cents, un.status, p.id AS property_id, p.name AS property_name
+		FROM units un
+		JOIN properties p ON p.id=un.property_id
+		WHERE un.organization_id=$1
+		ORDER BY p.name, un.label`, u.OrganizationID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "units query failed")
+		return
+	}
+	defer rows.Close()
+	writeJSON(w, http.StatusOK, collect(rows))
+}
+
+func (a *App) createUnit(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	var in struct {
+		PropertyID string `json:"property_id"`
+		Label      string `json:"label"`
+		RentCents  int64  `json:"rent_cents"`
+	}
+	if !decode(w, r, &in) || in.PropertyID == "" || in.Label == "" {
+		writeError(w, http.StatusBadRequest, "property and unit label are required")
+		return
+	}
+	if err := a.enforceUnitCapacity(r.Context(), u.OrganizationID, 1); err != nil {
+		writeError(w, http.StatusPaymentRequired, err.Error())
+		return
+	}
+	var id string
+	err := a.db.QueryRow(r.Context(), `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents) VALUES ($1,$2,$3,$4) RETURNING id`, u.OrganizationID, in.PropertyID, in.Label, in.RentCents).Scan(&id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unit create failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
@@ -363,6 +425,53 @@ func (a *App) createTenantAccessLink(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"url": strings.TrimRight(a.cfg.FrontendOrigin, "/") + "/tenant?token=" + url.QueryEscape(token), "expires_in_days": "30"})
 }
 
+func (a *App) tenantImportTemplate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-tenant-import-template.csv"`)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"full_name", "phone", "email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes"})
+	samples := [][]string{
+		{"Alice Wanjiku", "+254711111111", "alice@example.com", "12345678", "Nairobi Heights", "Kilimani Road", "Nairobi", "A-101", "45000", "2026-05-01", "5", "45000"},
+		{"Samuel Mutua", "+254722222222", "samuel@example.com", "23456789", "Nairobi Heights", "Kilimani Road", "Nairobi", "A-102", "38000", "2026-05-01", "5", "38000"},
+		{"Grace Njeri", "+254733333333", "grace@example.com", "34567890", "Skyline Apartments", "Mombasa Road", "Nairobi", "B-12", "52000", "2026-05-01", "1", "52000"},
+		{"Kevin Otieno", "+254744444444", "kevin@example.com", "45678901", "Skyline Apartments", "Mombasa Road", "Nairobi", "B-14", "52000", "2026-05-01", "1", "52000"},
+		{"Mary Achieng", "+254755555555", "mary@example.com", "56789012", "Meridian Heights", "Waiyaki Way", "Nairobi", "PH-1", "120000", "2026-05-01", "3", "120000"},
+		{"John Kariuki", "+254766666666", "john@example.com", "67890123", "Meridian Heights", "Waiyaki Way", "Nairobi", "C-04", "65000", "2026-05-01", "3", "65000"},
+		{"Faith Muthoni", "+254777777777", "faith@example.com", "78901234", "Garden Court", "Kiambu Road", "Nairobi", "G-07", "30000", "2026-05-01", "10", "30000"},
+		{"Brian Ouma", "+254788888888", "brian@example.com", "89012345", "Garden Court", "Kiambu Road", "Nairobi", "G-08", "30000", "2026-05-01", "10", "30000"},
+	}
+	for _, sample := range samples {
+		_ = cw.Write(sample)
+	}
+	cw.Flush()
+}
+
+func (a *App) previewTenantImport(w http.ResponseWriter, r *http.Request) {
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "multipart file field is required")
+		return
+	}
+	defer file.Close()
+	table, err := readImportTable(file, header)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mapping := suggestTenantMapping(table.Headers)
+	result := validateTenantImport(table, attachHeaders(mapping, table.Headers), 10)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"filename":          header.Filename,
+		"headers":           table.Headers,
+		"sample_rows":       firstRows(table.Rows, 10),
+		"total_rows":        len(table.Rows),
+		"suggested_mapping": mapping,
+		"required_fields":   []string{"full_name", "phone"},
+		"optional_fields":   []string{"email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes"},
+		"validation":        result,
+	})
+}
+
 func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	file, header, err := r.FormFile("file")
@@ -371,35 +480,88 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	records, err := readTenantImport(file, header)
+	table, err := readImportTable(file, header)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	mapping := suggestTenantMapping(table.Headers)
+	if rawMapping := r.FormValue("mapping"); rawMapping != "" {
+		if err := json.Unmarshal([]byte(rawMapping), &mapping); err != nil {
+			writeError(w, http.StatusBadRequest, "mapping must be valid json")
+			return
+		}
+	}
+	mapping = attachHeaders(mapping, table.Headers)
+	validation := validateTenantImport(table, mapping, len(table.Rows))
+	if validation.ValidRows == 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "no valid tenant rows found", "validation": validation})
+		return
+	}
+	unitsToCreate := 0
+	for _, row := range table.Rows {
+		rec := tenantImportRecord(row, mapping)
+		if rec.PropertyName != "" && rec.UnitLabel != "" {
+			unitsToCreate++
+		}
+	}
+	if unitsToCreate > 0 {
+		if err := a.enforceUnitCapacity(r.Context(), u.OrganizationID, unitsToCreate); err != nil {
+			writeError(w, http.StatusPaymentRequired, err.Error())
+			return
+		}
 	}
 	tx, _ := a.db.Begin(r.Context())
 	defer tx.Rollback(r.Context())
 	imported := 0
 	var errs []string
-	for i, rec := range records {
-		if rec[0] == "" || rec[1] == "" {
-			errs = append(errs, fmt.Sprintf("row %d missing name or phone", i+2))
+	for i, row := range table.Rows {
+		rec := tenantImportRecord(row, mapping)
+		if rec.FullName == "" || rec.Phone == "" {
+			errs = append(errs, fmt.Sprintf("row %d missing full_name or phone", i+2))
 			continue
 		}
-		_, err := tx.Exec(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email) VALUES ($1,$2,$3,$4)`, u.OrganizationID, rec[0], rec[1], rec[2])
+		var tenantID string
+		err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id) VALUES ($1,$2,$3,$4,$5) RETURNING id`, u.OrganizationID, rec.FullName, rec.Phone, rec.Email, rec.NationalID).Scan(&tenantID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("row %d: %v", i+2, err))
 			continue
+		}
+		if rec.PropertyName != "" && rec.UnitLabel != "" {
+			propertyID, err := ensureProperty(r.Context(), tx, u.OrganizationID, rec.PropertyName, rec.PropertyAddress, rec.City)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("row %d property: %v", i+2, err))
+				continue
+			}
+			unitID, err := ensureUnit(r.Context(), tx, u.OrganizationID, propertyID, rec.UnitLabel, rec.MonthlyRentCents)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("row %d unit: %v", i+2, err))
+				continue
+			}
+			startsOn := rec.LeaseStartDate
+			if startsOn == "" {
+				startsOn = time.Now().Format("2006-01-02")
+			}
+			dueDay := rec.DueDay
+			if dueDay == 0 {
+				dueDay = 1
+			}
+			if _, err := tx.Exec(r.Context(), `INSERT INTO leases (organization_id,tenant_id,unit_id,starts_on,due_day,rent_cents,deposit_cents) VALUES ($1,$2,$3,$4,$5,$6,$7)`, u.OrganizationID, tenantID, unitID, startsOn, dueDay, rec.MonthlyRentCents, rec.DepositCents); err != nil {
+				errs = append(errs, fmt.Sprintf("row %d lease: %v", i+2, err))
+				continue
+			}
+			_, _ = tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, unitID, u.OrganizationID)
 		}
 		imported++
 	}
 	errJSON, _ := json.Marshal(errs)
 	var jobID string
-	_ = tx.QueryRow(r.Context(), `INSERT INTO import_jobs (organization_id,kind,filename,total_rows,imported_rows,failed_rows,errors) VALUES ($1,'tenants',$2,$3,$4,$5,$6) RETURNING id`, u.OrganizationID, header.Filename, len(records), imported, len(errs), errJSON).Scan(&jobID)
+	_ = tx.QueryRow(r.Context(), `INSERT INTO import_jobs (organization_id,kind,filename,total_rows,imported_rows,failed_rows,errors) VALUES ($1,'tenants',$2,$3,$4,$5,$6) RETURNING id`, u.OrganizationID, header.Filename, len(table.Rows), imported, len(errs), errJSON).Scan(&jobID)
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "import commit failed")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": jobID, "total_rows": len(records), "imported_rows": imported, "failed_rows": len(errs), "errors": errs})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": jobID, "total_rows": len(table.Rows), "imported_rows": imported, "failed_rows": len(errs), "errors": errs})
 }
 
 func (a *App) exportTenantsCSV(w http.ResponseWriter, r *http.Request) {
@@ -461,6 +623,34 @@ func (a *App) monthlyExcelReport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-monthly-report.xlsx"`)
 	_, _ = w.Write(buf.Bytes())
+}
+
+func (a *App) listPayments(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	rows, err := a.db.Query(r.Context(), `SELECT pi.id, pi.due_on, pi.period_month, pi.amount_cents, pi.status,
+		       t.full_name AS tenant_name, t.phone AS tenant_phone, p.name AS property_name, un.label AS unit_label,
+		       COALESCE(pc.provider,'') AS provider, COALESCE(pc.transaction_ref,'') AS transaction_ref, COALESCE(pc.evidence_url,'') AS evidence_url,
+		       pc.created_at AS submitted_at
+		FROM payment_intents pi
+		JOIN leases l ON l.id=pi.lease_id
+		JOIN tenants t ON t.id=l.tenant_id
+		JOIN units un ON un.id=l.unit_id
+		JOIN properties p ON p.id=un.property_id
+		LEFT JOIN LATERAL (
+			SELECT provider, transaction_ref, evidence_url, created_at
+			FROM payment_confirmations
+			WHERE payment_intent_id=pi.id
+			ORDER BY created_at DESC
+			LIMIT 1
+		) pc ON true
+		WHERE pi.organization_id=$1
+		ORDER BY pi.due_on DESC, t.full_name`, u.OrganizationID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "payments query failed")
+		return
+	}
+	defer rows.Close()
+	writeJSON(w, http.StatusOK, collect(rows))
 }
 
 func (a *App) markPaid(w http.ResponseWriter, r *http.Request) {
@@ -770,6 +960,10 @@ func (a *App) auth(next http.Handler) http.Handler {
 		}
 		claims := token.Claims.(jwt.MapClaims)
 		u := authUser{ID: fmt.Sprint(claims["sub"]), OrganizationID: fmt.Sprint(claims["org"]), Email: fmt.Sprint(claims["email"]), Role: fmt.Sprint(claims["role"]), FullName: fmt.Sprint(claims["name"]), TenantID: fmt.Sprint(claims["tenant_id"])}
+		if !a.allowRequest(r.Context(), u.OrganizationID) {
+			writeError(w, http.StatusTooManyRequests, "plan request limit reached; retry in a minute or upgrade your plan")
+			return
+		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
 	})
 }
@@ -831,42 +1025,347 @@ func (a *App) recover(next http.Handler) http.Handler {
 	})
 }
 
-func readTenantImport(file multipart.File, header *multipart.FileHeader) ([][3]string, error) {
+type importTable struct {
+	Headers []string
+	Rows    [][]string
+}
+
+type tenantImport struct {
+	FullName         string
+	Phone            string
+	Email            string
+	NationalID       string
+	PropertyName     string
+	PropertyAddress  string
+	City             string
+	UnitLabel        string
+	MonthlyRentCents int64
+	LeaseStartDate   string
+	DueDay           int
+	DepositCents     int64
+}
+
+type importValidation struct {
+	ValidRows   int      `json:"valid_rows"`
+	InvalidRows int      `json:"invalid_rows"`
+	Errors      []string `json:"errors"`
+}
+
+func readImportTable(file multipart.File, header *multipart.FileHeader) (importTable, error) {
 	name := strings.ToLower(header.Filename)
 	var rows [][]string
 	if strings.HasSuffix(name, ".xlsx") {
 		tmp, err := io.ReadAll(file)
 		if err != nil {
-			return nil, err
+			return importTable{}, err
 		}
 		xl, err := excelize.OpenReader(bytes.NewReader(tmp))
 		if err != nil {
-			return nil, err
+			return importTable{}, err
 		}
 		sheet := xl.GetSheetName(0)
 		rows, err = xl.GetRows(sheet)
 		if err != nil {
-			return nil, err
+			return importTable{}, err
 		}
 	} else {
 		parsed, err := csv.NewReader(file).ReadAll()
 		if err != nil {
-			return nil, err
+			return importTable{}, err
 		}
 		rows = parsed
 	}
 	if len(rows) < 2 {
-		return nil, errors.New("file must include a header row and at least one tenant")
+		return importTable{}, errors.New("file must include a header row and at least one tenant")
 	}
-	var out [][3]string
+	headers := make([]string, len(rows[0]))
+	for i, header := range rows[0] {
+		headers[i] = strings.TrimSpace(header)
+	}
+	var data [][]string
 	for _, row := range rows[1:] {
-		var rec [3]string
-		for i := 0; i < len(row) && i < 3; i++ {
-			rec[i] = strings.TrimSpace(row[i])
+		normalized := make([]string, len(headers))
+		empty := true
+		for i := range headers {
+			if i < len(row) {
+				normalized[i] = strings.TrimSpace(row[i])
+				if normalized[i] != "" {
+					empty = false
+				}
+			}
 		}
-		out = append(out, rec)
+		if !empty {
+			data = append(data, normalized)
+		}
 	}
-	return out, nil
+	return importTable{Headers: headers, Rows: data}, nil
+}
+
+func suggestTenantMapping(headers []string) map[string]string {
+	aliases := map[string][]string{
+		"full_name":        {"full_name", "full name", "tenant", "tenant name", "name", "resident", "resident name"},
+		"phone":            {"phone", "phone number", "mobile", "mobile number", "msisdn", "contact", "contact phone"},
+		"email":            {"email", "email address", "mail"},
+		"national_id":      {"national_id", "national id", "id number", "id", "passport"},
+		"property_name":    {"property_name", "property name", "property", "building", "estate", "apartment"},
+		"property_address": {"property_address", "property address", "address", "location"},
+		"city":             {"city", "town"},
+		"unit_label":       {"unit_label", "unit label", "unit", "unit no", "unit number", "house", "house number", "door"},
+		"monthly_rent_kes": {"monthly_rent_kes", "monthly rent", "rent", "rent amount", "amount", "monthly_rent"},
+		"lease_start_date": {"lease_start_date", "lease start", "start date", "starts on", "move in", "move-in date"},
+		"due_day":          {"due_day", "due day", "rent due day", "due"},
+		"deposit_kes":      {"deposit_kes", "deposit", "security deposit"},
+	}
+	mapping := map[string]string{}
+	for field, names := range aliases {
+		for _, header := range headers {
+			clean := normalizeHeader(header)
+			for _, name := range names {
+				if clean == normalizeHeader(name) {
+					mapping[field] = header
+					break
+				}
+			}
+			if mapping[field] != "" {
+				break
+			}
+		}
+	}
+	return mapping
+}
+
+func validateTenantImport(table importTable, mapping map[string]string, limit int) importValidation {
+	result := importValidation{Errors: []string{}}
+	if mapping["full_name"] == "" {
+		result.Errors = append(result.Errors, "Map a column to full_name")
+	}
+	if mapping["phone"] == "" {
+		result.Errors = append(result.Errors, "Map a column to phone")
+	}
+	max := len(table.Rows)
+	if limit > 0 && limit < max {
+		max = limit
+	}
+	for i := 0; i < max; i++ {
+		rec := tenantImportRecord(table.Rows[i], mapping)
+		rowErrs := validateTenantRecord(rec)
+		if len(rowErrs) > 0 {
+			result.InvalidRows++
+			for _, err := range rowErrs {
+				result.Errors = append(result.Errors, fmt.Sprintf("row %d: %s", i+2, err))
+			}
+			continue
+		}
+		result.ValidRows++
+	}
+	return result
+}
+
+func validateTenantRecord(rec tenantImport) []string {
+	var errs []string
+	if rec.FullName == "" {
+		errs = append(errs, "full_name is required")
+	}
+	if rec.Phone == "" {
+		errs = append(errs, "phone is required")
+	}
+	if rec.DueDay < 0 || rec.DueDay > 28 {
+		errs = append(errs, "due_day must be between 1 and 28")
+	}
+	if rec.LeaseStartDate != "" {
+		if _, err := time.Parse("2006-01-02", rec.LeaseStartDate); err != nil {
+			errs = append(errs, "lease_start_date must use YYYY-MM-DD")
+		}
+	}
+	if rec.UnitLabel != "" && rec.MonthlyRentCents <= 0 {
+		errs = append(errs, "monthly_rent_kes is required when unit_label is provided")
+	}
+	if rec.PropertyName == "" && rec.UnitLabel != "" {
+		errs = append(errs, "property_name is required when unit_label is provided")
+	}
+	return errs
+}
+
+func tenantImportRecord(row []string, mapping map[string]string) tenantImport {
+	get := func(field string) string {
+		header := mapping[field]
+		if header == "" {
+			return ""
+		}
+		index := -1
+		for i, value := range mappingRowHeaders(mapping, field) {
+			if value == header {
+				index = i
+				break
+			}
+		}
+		if index < 0 || index >= len(row) {
+			return ""
+		}
+		return strings.TrimSpace(row[index])
+	}
+	return tenantImport{
+		FullName:         get("full_name"),
+		Phone:            get("phone"),
+		Email:            strings.ToLower(get("email")),
+		NationalID:       get("national_id"),
+		PropertyName:     get("property_name"),
+		PropertyAddress:  get("property_address"),
+		City:             get("city"),
+		UnitLabel:        get("unit_label"),
+		MonthlyRentCents: parseKESCents(get("monthly_rent_kes")),
+		LeaseStartDate:   get("lease_start_date"),
+		DueDay:           parseInt(get("due_day")),
+		DepositCents:     parseKESCents(get("deposit_kes")),
+	}
+}
+
+func mappingRowHeaders(mapping map[string]string, field string) []string {
+	headersRaw, ok := mapping["__headers"]
+	if !ok || headersRaw == "" {
+		return []string{}
+	}
+	return strings.Split(headersRaw, "\x1f")
+}
+
+func attachHeaders(mapping map[string]string, headers []string) map[string]string {
+	out := map[string]string{}
+	for key, value := range mapping {
+		out[key] = value
+	}
+	out["__headers"] = strings.Join(headers, "\x1f")
+	return out
+}
+
+func firstRows(rows [][]string, n int) [][]string {
+	if len(rows) <= n {
+		return rows
+	}
+	return rows[:n]
+}
+
+func normalizeHeader(header string) string {
+	header = strings.ToLower(strings.TrimSpace(header))
+	header = strings.ReplaceAll(header, "_", " ")
+	header = strings.ReplaceAll(header, "-", " ")
+	header = strings.Join(strings.Fields(header), " ")
+	return header
+}
+
+func parseKESCents(value string) int64 {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, ",", "")
+	value = strings.TrimPrefix(strings.ToLower(value), "kes")
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	amount, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0
+	}
+	return int64(amount * 100)
+}
+
+func parseInt(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	n, _ := strconv.Atoi(value)
+	return n
+}
+
+func ensureProperty(ctx context.Context, tx pgx.Tx, orgID, name, address, city string) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM properties WHERE organization_id=$1 AND lower(name)=lower($2) LIMIT 1`, orgID, name).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO properties (organization_id,name,address,city) VALUES ($1,$2,$3,$4) RETURNING id`, orgID, name, address, city).Scan(&id)
+	return id, err
+}
+
+func ensureUnit(ctx context.Context, tx pgx.Tx, orgID, propertyID, label string, rentCents int64) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM units WHERE organization_id=$1 AND property_id=$2 AND lower(label)=lower($3) LIMIT 1`, orgID, propertyID, label).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents,status) VALUES ($1,$2,$3,$4,'vacant') RETURNING id`, orgID, propertyID, label, rentCents).Scan(&id)
+	return id, err
+}
+
+func (a *App) allowRequest(ctx context.Context, orgID string) bool {
+	plan := a.organizationPlan(ctx, orgID)
+	limit := planRequestsPerMinute(plan)
+	key := orgID + ":" + plan
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	bucket := a.limits[key]
+	if bucket == nil || now.Sub(bucket.WindowStart) >= time.Minute {
+		a.limits[key] = &rateBucket{WindowStart: now, Count: 1}
+		return true
+	}
+	if bucket.Count >= limit {
+		return false
+	}
+	bucket.Count++
+	return true
+}
+
+func (a *App) enforceUnitCapacity(ctx context.Context, orgID string, additional int) error {
+	limit := planUnitLimit(a.organizationPlan(ctx, orgID))
+	if limit < 0 {
+		return nil
+	}
+	var current int
+	if err := a.db.QueryRow(ctx, `SELECT count(*) FROM units WHERE organization_id=$1`, orgID).Scan(&current); err != nil {
+		return err
+	}
+	if current+additional > limit {
+		return fmt.Errorf("current plan allows %d unit(s); upgrade in Settings to add more", limit)
+	}
+	return nil
+}
+
+func (a *App) organizationPlan(ctx context.Context, orgID string) string {
+	var plan string
+	if err := a.db.QueryRow(ctx, `SELECT plan FROM organizations WHERE id=$1`, orgID).Scan(&plan); err != nil || plan == "" {
+		return "free"
+	}
+	return plan
+}
+
+func planUnitLimit(plan string) int {
+	switch plan {
+	case "agency":
+		return -1
+	case "pro":
+		return 10
+	default:
+		return 2
+	}
+}
+
+func planRequestsPerMinute(plan string) int {
+	switch plan {
+	case "agency":
+		return 1000
+	case "pro":
+		return 300
+	case "starter":
+		return 120
+	default:
+		return 60
+	}
 }
 
 func collect(rows pgx.Rows) []map[string]any {
