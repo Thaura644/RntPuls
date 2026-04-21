@@ -77,6 +77,7 @@ func (a *App) Routes() http.Handler {
 	mux.Handle("POST /api/units", a.staffAuth(http.HandlerFunc(a.createUnit)))
 	mux.Handle("GET /api/tenants", a.staffAuth(http.HandlerFunc(a.listTenants)))
 	mux.Handle("POST /api/tenants", a.staffAuth(http.HandlerFunc(a.createTenant)))
+	mux.Handle("PUT /api/tenants/{tenantID}", a.staffAuth(http.HandlerFunc(a.updateTenant)))
 	mux.Handle("POST /api/tenants/{tenantID}/access-link", a.staffAuth(http.HandlerFunc(a.createTenantAccessLink)))
 	mux.Handle("GET /api/imports/tenants/template.csv", a.staffAuth(http.HandlerFunc(a.tenantImportTemplate)))
 	mux.Handle("POST /api/imports/tenants/preview", a.staffAuth(http.HandlerFunc(a.previewTenantImport)))
@@ -257,7 +258,7 @@ func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listProperties(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	rows, err := a.db.Query(r.Context(), `SELECT id, name, address, city, created_at FROM properties WHERE organization_id=$1 ORDER BY created_at DESC`, u.OrganizationID)
+	rows, err := a.db.Query(r.Context(), `SELECT id::text AS id, name, address, city, created_at FROM properties WHERE organization_id=$1 ORDER BY created_at DESC`, u.OrganizationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "properties query failed")
 		return
@@ -308,7 +309,7 @@ func (a *App) createProperty(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listUnits(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	rows, err := a.db.Query(r.Context(), `SELECT un.id, un.label, un.monthly_rent_cents, un.status, p.id AS property_id, p.name AS property_name
+	rows, err := a.db.Query(r.Context(), `SELECT un.id::text AS id, un.label, un.monthly_rent_cents, un.status, p.id::text AS property_id, p.name AS property_name
 		FROM units un
 		JOIN properties p ON p.id=un.property_id
 		WHERE un.organization_id=$1
@@ -347,7 +348,10 @@ func (a *App) createUnit(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listTenants(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	rows, err := a.db.Query(r.Context(), `SELECT t.id, t.full_name, t.phone, t.email, COALESCE(p.name,'') AS property_name, COALESCE(un.label,'') AS unit_label, COALESCE(l.rent_cents,0) AS rent_cents, COALESCE(l.status,'') AS lease_status, t.created_at
+	rows, err := a.db.Query(r.Context(), `SELECT t.id::text AS id, t.full_name, t.phone, t.email,
+			COALESCE(p.id::text,'') AS property_id, COALESCE(p.name,'') AS property_name,
+			COALESCE(un.id::text,'') AS unit_id, COALESCE(un.label,'') AS unit_label,
+			COALESCE(l.rent_cents,0) AS rent_cents, COALESCE(l.status,'') AS lease_status, t.created_at
 		FROM tenants t
 		LEFT JOIN leases l ON l.tenant_id=t.id AND l.status='active'
 		LEFT JOIN units un ON un.id=l.unit_id
@@ -405,6 +409,70 @@ func (a *App) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"id": tenantID})
 }
 
+func (a *App) updateTenant(w http.ResponseWriter, r *http.Request) {
+	u := mustUser(r)
+	tenantID := r.PathValue("tenantID")
+	var in struct {
+		FullName   string `json:"full_name"`
+		Phone      string `json:"phone"`
+		Email      string `json:"email"`
+		NationalID string `json:"national_id"`
+		UnitID     string `json:"unit_id"`
+		DueDay     int    `json:"due_day"`
+		RentCents  int64  `json:"rent_cents"`
+	}
+	if !decode(w, r, &in) || tenantID == "" || in.FullName == "" || in.Phone == "" {
+		writeError(w, http.StatusBadRequest, "tenant id, name and phone are required")
+		return
+	}
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "transaction failed")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	tag, err := tx.Exec(r.Context(), `UPDATE tenants SET full_name=$3, phone=$4, email=$5, national_id=$6 WHERE id=$1 AND organization_id=$2`, tenantID, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID)
+	if err != nil || tag.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	var oldUnitID string
+	_ = tx.QueryRow(r.Context(), `SELECT unit_id::text FROM leases WHERE tenant_id=$1 AND organization_id=$2 AND status='active' ORDER BY created_at DESC LIMIT 1`, tenantID, u.OrganizationID).Scan(&oldUnitID)
+	if in.UnitID != "" {
+		var rentCents int64
+		if err := tx.QueryRow(r.Context(), `SELECT monthly_rent_cents FROM units WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID).Scan(&rentCents); err != nil {
+			writeError(w, http.StatusBadRequest, "selected unit was not found")
+			return
+		}
+		if in.RentCents > 0 {
+			rentCents = in.RentCents
+		}
+		if in.DueDay == 0 {
+			in.DueDay = 1
+		}
+		if oldUnitID != "" && oldUnitID != in.UnitID {
+			_, _ = tx.Exec(r.Context(), `UPDATE leases SET status='ended', ends_on=current_date WHERE tenant_id=$1 AND organization_id=$2 AND status='active'`, tenantID, u.OrganizationID)
+			_, _ = tx.Exec(r.Context(), `UPDATE units SET status='vacant' WHERE id=$1 AND organization_id=$2 AND NOT EXISTS (SELECT 1 FROM leases WHERE unit_id=$1 AND organization_id=$2 AND status='active')`, oldUnitID, u.OrganizationID)
+			oldUnitID = ""
+		}
+		if oldUnitID == "" {
+			_, err = tx.Exec(r.Context(), `INSERT INTO leases (organization_id,tenant_id,unit_id,starts_on,due_day,rent_cents) VALUES ($1,$2,$3,current_date,$4,$5)`, u.OrganizationID, tenantID, in.UnitID, in.DueDay, rentCents)
+		} else {
+			_, err = tx.Exec(r.Context(), `UPDATE leases SET unit_id=$3, due_day=$4, rent_cents=$5 WHERE tenant_id=$1 AND organization_id=$2 AND status='active'`, tenantID, u.OrganizationID, in.UnitID, in.DueDay, rentCents)
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "lease update failed")
+			return
+		}
+		_, _ = tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID)
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "tenant update commit failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
 func (a *App) createTenantAccessLink(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	tenantID := r.PathValue("tenantID")
@@ -430,19 +498,6 @@ func (a *App) tenantImportTemplate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-tenant-import-template.csv"`)
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{"full_name", "phone", "email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes"})
-	samples := [][]string{
-		{"Alice Wanjiku", "+254711111111", "alice@example.com", "12345678", "Nairobi Heights", "Kilimani Road", "Nairobi", "A-101", "45000", "2026-05-01", "5", "45000"},
-		{"Samuel Mutua", "+254722222222", "samuel@example.com", "23456789", "Nairobi Heights", "Kilimani Road", "Nairobi", "A-102", "38000", "2026-05-01", "5", "38000"},
-		{"Grace Njeri", "+254733333333", "grace@example.com", "34567890", "Skyline Apartments", "Mombasa Road", "Nairobi", "B-12", "52000", "2026-05-01", "1", "52000"},
-		{"Kevin Otieno", "+254744444444", "kevin@example.com", "45678901", "Skyline Apartments", "Mombasa Road", "Nairobi", "B-14", "52000", "2026-05-01", "1", "52000"},
-		{"Mary Achieng", "+254755555555", "mary@example.com", "56789012", "Meridian Heights", "Waiyaki Way", "Nairobi", "PH-1", "120000", "2026-05-01", "3", "120000"},
-		{"John Kariuki", "+254766666666", "john@example.com", "67890123", "Meridian Heights", "Waiyaki Way", "Nairobi", "C-04", "65000", "2026-05-01", "3", "65000"},
-		{"Faith Muthoni", "+254777777777", "faith@example.com", "78901234", "Garden Court", "Kiambu Road", "Nairobi", "G-07", "30000", "2026-05-01", "10", "30000"},
-		{"Brian Ouma", "+254788888888", "brian@example.com", "89012345", "Garden Court", "Kiambu Road", "Nairobi", "G-08", "30000", "2026-05-01", "10", "30000"},
-	}
-	for _, sample := range samples {
-		_ = cw.Write(sample)
-	}
 	cw.Flush()
 }
 
@@ -627,7 +682,7 @@ func (a *App) monthlyExcelReport(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listPayments(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	rows, err := a.db.Query(r.Context(), `SELECT pi.id, pi.due_on, pi.period_month, pi.amount_cents, pi.status,
+	rows, err := a.db.Query(r.Context(), `SELECT pi.id::text AS id, pi.due_on, pi.period_month, pi.amount_cents, pi.status,
 		       t.full_name AS tenant_name, t.phone AS tenant_phone, p.name AS property_name, un.label AS unit_label,
 		       COALESCE(pc.provider,'') AS provider, COALESCE(pc.transaction_ref,'') AS transaction_ref, COALESCE(pc.evidence_url,'') AS evidence_url,
 		       pc.created_at AS submitted_at

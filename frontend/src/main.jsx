@@ -222,15 +222,24 @@ function Dashboard() {
 
 function Tenants() {
   const [tenants, setTenants] = useState([]);
+  const [properties, setProperties] = useState([]);
+  const [units, setUnits] = useState([]);
   const [form, setForm] = useState({ full_name: '', phone: '', email: '' });
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [importOpen, setImportOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
   const load = () => {
     setError('');
-    return request('/tenants')
-      .then(data => setTenants(Array.isArray(data) ? data : []))
-      .catch(e => setError(e.message));
+    return Promise.all([
+      request('/tenants'),
+      request('/properties'),
+      request('/units')
+    ]).then(([tenantData, propertyData, unitData]) => {
+      setTenants(Array.isArray(tenantData) ? tenantData : []);
+      setProperties(Array.isArray(propertyData) ? propertyData : []);
+      setUnits(Array.isArray(unitData) ? unitData : []);
+    }).catch(e => setError(e.message));
   };
   useEffect(() => {
     load();
@@ -246,6 +255,38 @@ function Tenants() {
     if (!out) return;
     await navigator.clipboard.writeText(out.url);
     setNotice('Tenant portal link copied. Send it by SMS or WhatsApp.');
+  }
+  function startEdit(tenant) {
+    setEditing({
+      id: tenant.id,
+      full_name: tenant.full_name || '',
+      phone: tenant.phone || '',
+      email: tenant.email || '',
+      property_id: tenant.property_id || '',
+      unit_id: tenant.unit_id || ''
+    });
+  }
+  async function saveEdit() {
+    setError('');
+    const selectedUnit = units.find(unit => unit.id === editing.unit_id);
+    const out = await request(`/tenants/${editing.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        full_name: editing.full_name,
+        phone: editing.phone,
+        email: editing.email,
+        unit_id: editing.unit_id,
+        rent_cents: selectedUnit?.monthly_rent_cents || 0
+      })
+    }).catch(e => setError(e.message));
+    if (out) {
+      setNotice('Tenant updated');
+      setEditing(null);
+      load();
+    }
+  }
+  function unitsForProperty(propertyID) {
+    return units.filter(unit => unit.property_id === propertyID);
   }
   return (
     <Page title="Resident directory" subtitle="Tenant records come from the API. Add one manually or import a CSV/XLSX file.">
@@ -263,7 +304,24 @@ function Tenants() {
       </div>
       {error && <p className="error">{error}</p>}{notice && <p className="notice">{notice}</p>}
       <section className="panel tablePanel">
-        {tenants.length === 0 ? <Empty title="No tenants yet" text="Create or import tenants to populate your ledger." /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th><th>Tenant access</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td>{t.full_name}</td><td>{t.phone}</td><td>{t.email}</td><td>{t.property_name}</td><td>{t.unit_label}</td><td>{kes(t.rent_cents || 0)}</td><td><button className="linkButton" onClick={() => copyTenantLink(t.id)}>Copy link</button></td></tr>)}</tbody></table>}
+        {tenants.length === 0 ? <Empty title="No tenants yet" text="Create or import tenants to populate your ledger." /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th><th>Tenant access</th><th>Actions</th></tr></thead><tbody>{tenants.map(t => {
+          const isEditing = editing?.id === t.id;
+          const rowPropertyID = isEditing ? editing.property_id : t.property_id;
+          const rowUnitID = isEditing ? editing.unit_id : t.unit_id;
+          const rowUnit = units.find(unit => unit.id === rowUnitID);
+          return (
+            <tr key={t.id}>
+              <td>{isEditing ? <input value={editing.full_name} onChange={e => setEditing({ ...editing, full_name: e.target.value })} /> : t.full_name}</td>
+              <td>{isEditing ? <input value={editing.phone} onChange={e => setEditing({ ...editing, phone: e.target.value })} /> : t.phone}</td>
+              <td>{isEditing ? <input value={editing.email} onChange={e => setEditing({ ...editing, email: e.target.value })} /> : t.email}</td>
+              <td>{isEditing ? <select value={editing.property_id} onChange={e => setEditing({ ...editing, property_id: e.target.value, unit_id: '' })}><option value="">Choose property</option>{properties.map(property => <option key={property.id} value={property.id}>{property.name}</option>)}</select> : t.property_name}</td>
+              <td>{isEditing ? <select value={editing.unit_id} disabled={!editing.property_id} onChange={e => setEditing({ ...editing, unit_id: e.target.value })}><option value="">Choose unit</option>{unitsForProperty(editing.property_id).map(unit => <option key={unit.id} value={unit.id}>{unit.label} · {kes(unit.monthly_rent_cents || 0)}</option>)}</select> : t.unit_label}</td>
+              <td>{kes((isEditing ? rowUnit?.monthly_rent_cents : t.rent_cents) || 0)}</td>
+              <td><button className="linkButton" onClick={() => copyTenantLink(t.id)}>Copy link</button></td>
+              <td>{isEditing ? <div className="rowActions"><button className="linkButton" onClick={saveEdit}>Save</button><button className="linkButton muted" onClick={() => setEditing(null)}>Cancel</button></div> : <button className="linkButton" onClick={() => startEdit(t)}>Edit</button>}</td>
+            </tr>
+          );
+        })}</tbody></table>}
       </section>
       {importOpen && <ImportWizard onClose={() => setImportOpen(false)} onImported={(summary) => { setNotice(`Imported ${summary.imported_rows} of ${summary.total_rows} rows`); setImportOpen(false); load(); }} />}
     </Page>

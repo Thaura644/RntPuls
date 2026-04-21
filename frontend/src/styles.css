@@ -47,6 +47,7 @@ textarea { min-height: 120px; resize: vertical; }
 input:focus, textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0,108,73,.08); }
 select:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0,108,73,.08); }
 .linkButton { border: 0; background: transparent; color: var(--primary); font-weight: 800; cursor: pointer; }
+.linkButton.muted { color: rgba(11,28,48,.55); }
 .app { display: grid; grid-template-columns: 288px minmax(0, 1fr); min-height: 100vh; }
 .sidebar { position: sticky; top: 0; height: 100vh; background: white; padding: 2rem 1.4rem; display: flex; flex-direction: column; gap: 2rem; box-shadow: 18px 0 40px rgba(11,28,48,.04); }
 .tagline { display: block; margin-top: .25rem; color: rgba(11,28,48,.48); font-size: .72rem; font-weight: 900; text-transform: uppercase; letter-spacing: .08em; }
@@ -75,6 +76,8 @@ select:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0,108,73
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 1rem 1.2rem; border-bottom: 1px solid rgba(187,202,191,.2); text-align: left; white-space: nowrap; }
 th { font-size: .72rem; text-transform: uppercase; letter-spacing: .09em; color: rgba(11,28,48,.55); }
+.tablePanel input, .tablePanel select { min-width: 170px; padding: .65rem .75rem; }
+.rowActions { display: inline-flex; gap: .7rem; align-items: center; }
 .empty { padding: 4rem 2rem; text-align: center; color: rgba(11,28,48,.75); }
 .plans { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 1rem; }
 .plan.popular { border-color: var(--primary); box-shadow: 0 22px 58px rgba(0,108,73,.16); }
