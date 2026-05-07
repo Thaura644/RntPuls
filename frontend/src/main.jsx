@@ -125,7 +125,7 @@ function Landing({ onAuth }) {
       <section className="hero">
         <div className="heroText">
           <span className="pill">Automated rent collection for Kenyan landlords</span>
-          <h1>Stop chasing rent.<br />Start running a business.</h1>
+          <h1>Stop chasing rent.</h1>
           <p>RentPulse keeps tenants, due dates, reminders, payment verification, and monthly reports in one system. No more spreadsheets, no more missed payments.</p>
           <div className="actions">
             <button className="btn primary big" onClick={onAuth}>Create free account</button>
@@ -192,12 +192,17 @@ function Landing({ onAuth }) {
       <section className="trustBand" id="faq">
         <h2>Frequently asked questions</h2>
         <div className="faqGrid">
-          <FAQ q="Do I need M-Pesa Daraja credentials?" a="No. RentPulse works without them. You manually verify payments. Add Daraja credentials later to automate M-Pesa transaction verification." />
-          <FAQ q="Can tenants pay through the app?" a="Tenants use a portal link to submit payment references and upload screenshots. Actual payment happens via their bank or M-Pesa — RentPulse tracks and verifies." />
-          <FAQ q="What happens when I exceed my unit limit?" a="You'll see a prompt to upgrade. Your existing data is never deleted. Upgrade instantly and continue without interruption." />
-          <FAQ q="Is my data secure?" a="All data is encrypted at rest in PostgreSQL. Passwords are hashed with bcrypt. JWT tokens expire after 15 minutes with refresh token rotation." />
-          <FAQ q="Can I export my data?" a="Yes. Export tenants to CSV, generate monthly Excel reports, and access the full API for programmatic data access." />
-          <FAQ q="Do you offer a free trial of Pro?" a="Yes. Start on the Free plan and upgrade to Pro anytime. You get full access to SMS reminders, M-Pesa verification, and Excel reports." />
+          <FAQ q="Do I need M-Pesa Daraja credentials?" a="No. You can use RentPulse immediately without Daraja. Manual payment tracking is supported from day one, and you can enable automated M-Pesa verification later if needed." />
+          <FAQ q="Can tenants make payments in the app?" a="Tenants can submit payment details through a portal link, including payment references and proof of payment. RentPulse then helps you reconcile and verify those payments." />
+          <FAQ q="What happens if I go beyond my unit limit?" a="You will be prompted to upgrade your plan. Your data stays intact, and you can keep working after upgrading." />
+          <FAQ q="Is my information protected?" a="Yes. Your data is protected using industry-standard security measures, including encryption, secure access controls, and regular system monitoring." />
+          <FAQ q="Can I download my records?" a="Yes. You can export tenant records to CSV, generate monthly Excel reports, and access your data through the API." />
+          <FAQ q="Can I try Pro before paying?" a="Yes. Start with the Free plan and upgrade whenever you are ready. Pro includes SMS reminders, M-Pesa verification, and Excel reports." />
+          <FAQ q="Can I manage multiple properties?" a="Yes. You can organize tenants and units across one or more properties from a single dashboard." />
+          <FAQ q="Does RentPulse work on mobile phones?" a="Yes. The platform is designed to work smoothly on both mobile and desktop browsers." />
+          <FAQ q="Will tenants receive payment reminders?" a="Yes. When SMS reminders are enabled on your plan, tenants get automated messages before the due date, on the due date, and after arrears are flagged." />
+          <FAQ q="Can I change plans later?" a="Yes. You can upgrade or downgrade your plan at any time based on your needs." />
+          <FAQ q="Can I import existing tenants?" a="Yes. You can upload a CSV or XLSX file and the import wizard will map columns automatically and validate every row." />
         </div>
       </section>
 
