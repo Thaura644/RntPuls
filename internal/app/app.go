@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
@@ -20,7 +19,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Thaura644/RntPuls/internal/config"
@@ -32,41 +30,39 @@ import (
 )
 
 type App struct {
-	cfg    config.Config
-	db     *pgxpool.Pool
-	logger *slog.Logger
-	limits map[string]*rateBucket
-	mu     sync.Mutex
+	cfg         config.Config
+	db          *pgxpool.Pool
+	logger      *slog.Logger
+	rateLimiter *rateLimiter
+	metrics     *metrics
 }
-
-type rateBucket struct {
-	WindowStart time.Time
-	Count       int
-}
-
-type authUser struct {
-	ID             string
-	OrganizationID string
-	Email          string
-	Role           string
-	FullName       string
-	TenantID       string
-}
-
-type ctxKey string
-
-const userKey ctxKey = "user"
 
 func New(cfg config.Config, db *pgxpool.Pool, logger *slog.Logger) *App {
-	return &App{cfg: cfg, db: db, logger: logger, limits: map[string]*rateBucket{}}
+	app := &App{
+		cfg:         cfg,
+		db:          db,
+		logger:      logger,
+		rateLimiter: newRateLimiter(),
+		metrics:     &metrics{},
+	}
+
+	if err := app.rateLimiter.init(context.Background(), db); err != nil {
+		logger.Warn("rate limiter init failed", "error", err)
+	}
+
+	return app
 }
 
 func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("GET /health", a.health)
+	mux.HandleFunc("GET /metrics", a.metricsHandler().ServeHTTP)
 	mux.HandleFunc("GET /api/plans", a.plans)
 	mux.HandleFunc("POST /api/auth/register", a.register)
 	mux.HandleFunc("POST /api/auth/login", a.login)
+	mux.HandleFunc("POST /api/auth/refresh", a.refreshToken)
+	mux.HandleFunc("POST /api/auth/logout", a.logout)
 	mux.Handle("GET /api/me", a.staffAuth(http.HandlerFunc(a.me)))
 	mux.Handle("GET /api/dashboard", a.staffAuth(http.HandlerFunc(a.dashboard)))
 	mux.Handle("GET /api/settings", a.staffAuth(http.HandlerFunc(a.settings)))
@@ -91,17 +87,31 @@ func (a *App) Routes() http.Handler {
 	mux.Handle("GET /api/tenant/me", a.tenantAuth(http.HandlerFunc(a.tenantMe)))
 	mux.Handle("POST /api/tenant/uploads", a.tenantAuth(http.HandlerFunc(a.tenantUpload)))
 	mux.Handle("POST /api/tenant/payments/mark-paid", a.tenantAuth(http.HandlerFunc(a.tenantMarkPaid)))
-	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(a.cfg.UploadDir))))
-	return a.cors(a.recover(mux))
+
+	uploads := http.StripPrefix("/uploads/", http.FileServer(http.Dir(a.cfg.UploadDir)))
+	mux.Handle("/uploads/", a.cors(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "uploads are read-only")
+			return
+		}
+		uploads.ServeHTTP(w, r)
+	})))
+
+	return a.requestID(a.requestLogger(a.panicRecover(a.cors(mux))))
 }
 
 func (a *App) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
+
 	if err := a.db.Ping(ctx); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "database unavailable")
 		return
 	}
+
+	stats := a.db.Stat()
+	a.metrics.updatePoolStats(int(stats.AcquiredConns()), int(stats.IdleConns()), int(stats.MaxConns()))
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -110,7 +120,7 @@ func (a *App) plans(w http.ResponseWriter, r *http.Request) {
 		{"id": "free", "name": "Free", "price_cents": 0, "unit_limit": 2, "requests_per_minute": 60, "features": []string{"Tenant directory", "Manual payment tracking"}},
 		{"id": "starter", "name": "Starter", "price_cents": 50000, "unit_limit": 2, "requests_per_minute": 120, "features": []string{"Automated invoices", "Basic rent tracking", "CSV exports", "Import wizard"}},
 		{"id": "pro", "name": "Pro", "price_cents": 120000, "unit_limit": 10, "requests_per_minute": 300, "features": []string{"WhatsApp/SMS reminders", "M-Pesa verification workflow", "Excel reports", "Imports"}},
-		{"id": "agency", "name": "Agency", "price_cents": nil, "unit_limit": nil, "requests_per_minute": 1000, "features": []string{"Unlimited units", "Multi-user access", "Branding", "Priority support"}},
+		{"id": "agency", "name": "Agency", "price_cents": nil, "unit_limit": nil, "requests_per_minute": 1000, "features": []string{"Unlimited units", "Multi-user Access", "Branding", "Priority support"}},
 	})
 }
 
@@ -130,34 +140,70 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "organization, name, email and an 8+ character password are required")
 		return
 	}
+
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
 	if err != nil {
+		a.logger.Error("password hashing failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "password hashing failed")
 		return
 	}
+
 	tx, err := a.db.Begin(r.Context())
 	if err != nil {
+		a.logger.Error("transaction begin failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "transaction failed")
 		return
 	}
 	defer tx.Rollback(r.Context())
+
 	var orgID, userID string
 	if err := tx.QueryRow(r.Context(), `INSERT INTO organizations (name) VALUES ($1) RETURNING id`, in.OrganizationName).Scan(&orgID); err != nil {
+		a.logger.Error("organization create failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "organization create failed")
 		return
 	}
-	_, _ = tx.Exec(r.Context(), `INSERT INTO organization_settings (organization_id) VALUES ($1)`, orgID)
-	err = tx.QueryRow(r.Context(), `INSERT INTO users (organization_id,email,password_hash,full_name,phone,role) VALUES ($1,$2,$3,$4,$5,'owner') RETURNING id`, orgID, in.Email, string(hash), in.FullName, in.Phone).Scan(&userID)
-	if err != nil {
-		writeError(w, http.StatusConflict, "email is already registered")
+
+	if _, err := tx.Exec(r.Context(), `INSERT INTO organization_settings (organization_id) VALUES ($1)`, orgID); err != nil {
+		a.logger.Error("organization settings create failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "organization settings create failed")
 		return
 	}
+
+	if err := tx.QueryRow(r.Context(), `INSERT INTO users (organization_id,email,password_hash,full_name,phone,role) VALUES ($1,$2,$3,$4,$5,'owner') RETURNING id`, orgID, in.Email, string(hash), in.FullName, in.Phone).Scan(&userID); err != nil {
+		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+			writeError(w, http.StatusConflict, "email is already registered")
+			return
+		}
+		a.logger.Error("user create failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "user create failed")
+		return
+	}
+
 	if err := tx.Commit(r.Context()); err != nil {
+		a.logger.Error("registration commit failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "registration commit failed")
 		return
 	}
-	token, _ := a.token(authUser{ID: userID, OrganizationID: orgID, Email: in.Email, Role: "owner", FullName: in.FullName})
-	writeJSON(w, http.StatusCreated, map[string]any{"token": token, "user": map[string]string{"id": userID, "organization_id": orgID, "email": in.Email, "role": "owner", "full_name": in.FullName}})
+
+	token, err := a.token(authUser{ID: userID, OrganizationID: orgID, Email: in.Email, Role: "owner", FullName: in.FullName})
+	if err != nil {
+		a.logger.Error("token generation failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "token generation failed")
+		return
+	}
+
+	a.recordLoginAttempt(r.Context(), in.Email, clientIP(r), true)
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"token": token,
+		"user": map[string]string{
+			"id":              userID,
+			"organization_id": orgID,
+			"email":           in.Email,
+			"role":            "owner",
+			"full_name":       in.FullName,
+		},
+	})
 }
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
@@ -168,15 +214,158 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+
+	ip := clientIP(r)
+
+	attempts, err := a.getFailedLoginAttempts(r.Context(), in.Email, ip)
+	if err != nil {
+		a.logger.Error("login attempt check failed", "error", err)
+	}
+	if attempts >= 5 {
+		writeError(w, http.StatusTooManyRequests, "too many failed login attempts, try again later")
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(in.Email))
 	var u authUser
 	var hash string
-	err := a.db.QueryRow(r.Context(), `SELECT id, organization_id, email, password_hash, full_name, role FROM users WHERE email=$1`, strings.ToLower(strings.TrimSpace(in.Email))).Scan(&u.ID, &u.OrganizationID, &u.Email, &hash, &u.FullName, &u.Role)
-	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(in.Password)) != nil {
+	err = a.db.QueryRow(r.Context(), `SELECT id, organization_id, email, password_hash, full_name, role FROM users WHERE email=$1`, email).Scan(&u.ID, &u.OrganizationID, &u.Email, &hash, &u.FullName, &u.Role)
+	if err != nil {
+		a.recordLoginAttempt(r.Context(), email, ip, false)
 		writeError(w, http.StatusUnauthorized, "invalid email or password")
 		return
 	}
-	token, _ := a.token(u)
-	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": u})
+
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(in.Password)); err != nil {
+		a.recordLoginAttempt(r.Context(), email, ip, false)
+		writeError(w, http.StatusUnauthorized, "invalid email or password")
+		return
+	}
+
+	a.recordLoginAttempt(r.Context(), email, ip, true)
+
+	token, err := a.token(u)
+	if err != nil {
+		a.logger.Error("token generation failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "token generation failed")
+		return
+	}
+
+	refreshToken, _, err := a.createRefreshToken(r.Context(), u.ID, ip, r.UserAgent())
+	if err != nil {
+		a.logger.Error("refresh token creation failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "session creation failed")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":         token,
+		"refresh_token": refreshToken,
+		"user":          u,
+	})
+}
+
+func (a *App) refreshToken(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+
+	if in.RefreshToken == "" {
+		writeError(w, http.StatusBadRequest, "refresh token is required")
+		return
+	}
+
+	tokenHash := hashToken(in.RefreshToken)
+
+	var userID string
+	var expiresAt time.Time
+	var revoked *time.Time
+
+	err := a.db.QueryRow(r.Context(),
+		`SELECT u.id, rt.expires_at, rt.revoked_at FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id WHERE rt.token_hash = $1`,
+		tokenHash,
+	).Scan(&userID, &expiresAt, &revoked)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusUnauthorized, "invalid refresh token")
+			return
+		}
+		a.logger.Error("refresh token lookup failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	if revoked != nil {
+		writeError(w, http.StatusUnauthorized, "token has been revoked")
+		return
+	}
+
+	if time.Now().After(expiresAt) {
+		a.db.Exec(r.Context(), `UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1`, tokenHash)
+		writeError(w, http.StatusUnauthorized, "refresh token expired")
+		return
+	}
+
+	var u authUser
+	err = a.db.QueryRow(r.Context(), `SELECT id, organization_id, email, full_name, role FROM users WHERE id = $1`, userID).Scan(&u.ID, &u.OrganizationID, &u.Email, &u.FullName, &u.Role)
+	if err != nil {
+		a.logger.Error("user lookup failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	token, err := a.token(u)
+	if err != nil {
+		a.logger.Error("token generation failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "token generation failed")
+		return
+	}
+
+	a.db.Exec(r.Context(), `UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1`, tokenHash)
+
+	newRefreshToken, _, err := a.createRefreshToken(r.Context(), u.ID, clientIP(r), r.UserAgent())
+	if err != nil {
+		a.logger.Error("refresh token creation failed", "error", err)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":         token,
+		"refresh_token": newRefreshToken,
+	})
+}
+
+func (a *App) logout(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		writeError(w, http.StatusUnauthorized, "missing bearer token")
+		return
+	}
+
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	token, err := jwt.ParseWithClaims(tokenStr, jwt.MapClaims{}, func(token *jwt.Token) (any, error) {
+		return []byte(a.cfg.JWTSecret), nil
+	})
+	if err != nil || !token.Valid {
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid token claims")
+		return
+	}
+
+	userID := toString(claims["sub"])
+	if userID != "" {
+		a.db.Exec(r.Context(), `UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
 
 func (a *App) me(w http.ResponseWriter, r *http.Request) {
@@ -185,13 +374,17 @@ func (a *App) me(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
-	_, _ = a.db.Exec(r.Context(), `INSERT INTO payment_intents (organization_id, lease_id, period_month, due_on, amount_cents, status)
+
+	if _, err := a.db.Exec(r.Context(), `INSERT INTO payment_intents (organization_id, lease_id, period_month, due_on, amount_cents, status)
 		SELECT l.organization_id, l.id, date_trunc('month', now())::date,
 		       (date_trunc('month', now())::date + (l.due_day - 1) * interval '1 day')::date,
 		       l.rent_cents,
 		       CASE WHEN (date_trunc('month', now())::date + (l.due_day - 1) * interval '1 day')::date < current_date THEN 'overdue' ELSE 'due' END
 		FROM leases l WHERE l.organization_id=$1 AND l.status='active'
-		ON CONFLICT (lease_id, period_month) DO NOTHING`, u.OrganizationID)
+		ON CONFLICT (lease_id, period_month) DO NOTHING`, u.OrganizationID); err != nil {
+		a.logger.Error("payment intent generation failed", "error", err)
+	}
+
 	var out struct {
 		Units          int64 `json:"units"`
 		OccupiedUnits  int64 `json:"occupied_units"`
@@ -201,9 +394,19 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 		OverdueCents   int64 `json:"overdue_cents"`
 		PendingCount   int64 `json:"pending_count"`
 	}
-	_ = a.db.QueryRow(r.Context(), `SELECT count(*), count(*) FILTER (WHERE status='occupied') FROM units WHERE organization_id=$1`, u.OrganizationID).Scan(&out.Units, &out.OccupiedUnits)
-	_ = a.db.QueryRow(r.Context(), `SELECT count(*) FROM tenants WHERE organization_id=$1`, u.OrganizationID).Scan(&out.Tenants)
-	_ = a.db.QueryRow(r.Context(), `SELECT COALESCE(sum(amount_cents),0), COALESCE(sum(amount_cents) FILTER (WHERE status='verified'),0), COALESCE(sum(amount_cents) FILTER (WHERE status='overdue'),0), count(*) FILTER (WHERE status IN ('due','tenant_marked_paid','overdue')) FROM payment_intents WHERE organization_id=$1 AND period_month=date_trunc('month', now())::date`, u.OrganizationID).Scan(&out.TotalDueCents, &out.CollectedCents, &out.OverdueCents, &out.PendingCount)
+
+	if err := a.db.QueryRow(r.Context(), `SELECT count(*), count(*) FILTER (WHERE status='occupied') FROM units WHERE organization_id=$1`, u.OrganizationID).Scan(&out.Units, &out.OccupiedUnits); err != nil {
+		a.logger.Error("units query failed", "error", err)
+	}
+
+	if err := a.db.QueryRow(r.Context(), `SELECT count(*) FROM tenants WHERE organization_id=$1`, u.OrganizationID).Scan(&out.Tenants); err != nil {
+		a.logger.Error("tenants query failed", "error", err)
+	}
+
+	if err := a.db.QueryRow(r.Context(), `SELECT COALESCE(sum(amount_cents),0), COALESCE(sum(amount_cents) FILTER (WHERE status='verified'),0), COALESCE(sum(amount_cents) FILTER (WHERE status='overdue'),0), count(*) FILTER (WHERE status IN ('due','tenant_marked_paid','overdue')) FROM payment_intents WHERE organization_id=$1 AND period_month=date_trunc('month', now())::date`, u.OrganizationID).Scan(&out.TotalDueCents, &out.CollectedCents, &out.OverdueCents, &out.PendingCount); err != nil {
+		a.logger.Error("payment stats query failed", "error", err)
+	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -213,6 +416,7 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		FROM organization_settings s
 		JOIN organizations o ON o.id=s.organization_id
 		WHERE s.organization_id=$1`, u.OrganizationID)
+
 	var out struct {
 		MPesaPaybill       string `json:"mpesa_paybill"`
 		MPesaTill          string `json:"mpesa_till"`
@@ -223,9 +427,15 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		Plan               string `json:"plan"`
 	}
 	if err := row.Scan(&out.MPesaPaybill, &out.MPesaTill, &out.SMSSenderID, &out.ReminderBeforeDays, &out.ReminderTemplate, &out.EscalationTemplate, &out.Plan); err != nil {
-		writeError(w, http.StatusNotFound, "settings not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "settings not found")
+			return
+		}
+		a.logger.Error("settings query failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "settings query failed")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -248,11 +458,13 @@ func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
 	if in.SMSSenderID == "" {
 		in.SMSSenderID = "RentPulse"
 	}
-	_, err := a.db.Exec(r.Context(), `UPDATE organization_settings SET mpesa_paybill=$2, mpesa_till=$3, sms_sender_id=$4, reminder_before_days=$5, reminder_template=$6, escalation_template=$7, updated_at=now() WHERE organization_id=$1`, u.OrganizationID, in.MPesaPaybill, in.MPesaTill, in.SMSSenderID, in.ReminderBeforeDays, in.ReminderTemplate, in.EscalationTemplate)
-	if err != nil {
+
+	if _, err := a.db.Exec(r.Context(), `UPDATE organization_settings SET mpesa_paybill=$2, mpesa_till=$3, sms_sender_id=$4, reminder_before_days=$5, reminder_template=$6, escalation_template=$7, updated_at=now() WHERE organization_id=$1`, u.OrganizationID, in.MPesaPaybill, in.MPesaTill, in.SMSSenderID, in.ReminderBeforeDays, in.ReminderTemplate, in.EscalationTemplate); err != nil {
+		a.logger.Error("settings update failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "settings update failed")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
@@ -260,6 +472,7 @@ func (a *App) listProperties(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	rows, err := a.db.Query(r.Context(), `SELECT id::text AS id, name, address, city, created_at FROM properties WHERE organization_id=$1 ORDER BY created_at DESC`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("properties query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "properties query failed")
 		return
 	}
@@ -288,22 +501,36 @@ func (a *App) createProperty(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	tx, _ := a.db.Begin(r.Context())
+
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		a.logger.Error("transaction begin failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "transaction failed")
+		return
+	}
 	defer tx.Rollback(r.Context())
+
 	var id string
 	if err := tx.QueryRow(r.Context(), `INSERT INTO properties (organization_id,name,address,city) VALUES ($1,$2,$3,$4) RETURNING id`, u.OrganizationID, in.Name, in.Address, in.City).Scan(&id); err != nil {
+		a.logger.Error("property create failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "property create failed")
 		return
 	}
+
 	for _, unit := range in.Units {
 		if unit.Label != "" {
-			_, _ = tx.Exec(r.Context(), `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents) VALUES ($1,$2,$3,$4)`, u.OrganizationID, id, unit.Label, unit.RentCents)
+			if _, err := tx.Exec(r.Context(), `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents) VALUES ($1,$2,$3,$4)`, u.OrganizationID, id, unit.Label, unit.RentCents); err != nil {
+				a.logger.Warn("unit insert skipped", "label", unit.Label, "error", err)
+			}
 		}
 	}
+
 	if err := tx.Commit(r.Context()); err != nil {
+		a.logger.Error("property commit failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "property commit failed")
 		return
 	}
+
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
@@ -315,6 +542,7 @@ func (a *App) listUnits(w http.ResponseWriter, r *http.Request) {
 		WHERE un.organization_id=$1
 		ORDER BY p.name, un.label`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("units query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "units query failed")
 		return
 	}
@@ -337,12 +565,15 @@ func (a *App) createUnit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusPaymentRequired, err.Error())
 		return
 	}
+
 	var id string
 	err := a.db.QueryRow(r.Context(), `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents) VALUES ($1,$2,$3,$4) RETURNING id`, u.OrganizationID, in.PropertyID, in.Label, in.RentCents).Scan(&id)
 	if err != nil {
+		a.logger.Error("unit create failed", "error", err)
 		writeError(w, http.StatusBadRequest, "unit create failed")
 		return
 	}
+
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
@@ -359,6 +590,7 @@ func (a *App) listTenants(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN properties p ON p.id=un.property_id
 		WHERE t.organization_id=$1 ORDER BY t.created_at DESC`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("tenants query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "tenants query failed")
 		return
 	}
@@ -388,13 +620,22 @@ func (a *App) createTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tenant name and phone are required")
 		return
 	}
-	tx, _ := a.db.Begin(r.Context())
+
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		a.logger.Error("transaction begin failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "transaction failed")
+		return
+	}
 	defer tx.Rollback(r.Context())
+
 	var tenantID string
 	if err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id,payment_method,bank_name,bank_account_number,mpesa_paybill,mpesa_account_number) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID, in.PaymentMethod, in.BankName, in.BankAccountNumber, in.MPesaPaybill, in.MPesaAccountNumber).Scan(&tenantID); err != nil {
+		a.logger.Error("tenant create failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "tenant create failed")
 		return
 	}
+
 	if in.UnitID != "" {
 		if in.DueDay == 0 {
 			in.DueDay = 1
@@ -403,15 +644,21 @@ func (a *App) createTenant(w http.ResponseWriter, r *http.Request) {
 			in.StartsOn = time.Now().Format("2006-01-02")
 		}
 		if _, err := tx.Exec(r.Context(), `INSERT INTO leases (organization_id,tenant_id,unit_id,starts_on,due_day,rent_cents,deposit_cents) VALUES ($1,$2,$3,$4,$5,$6,$7)`, u.OrganizationID, tenantID, in.UnitID, in.StartsOn, in.DueDay, in.RentCents, in.DepositCents); err != nil {
+			a.logger.Error("lease create failed", "error", err)
 			writeError(w, http.StatusBadRequest, "lease create failed")
 			return
 		}
-		_, _ = tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID)
+		if _, err := tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID); err != nil {
+			a.logger.Warn("unit status update failed", "error", err)
+		}
 	}
+
 	if err := tx.Commit(r.Context()); err != nil {
+		a.logger.Error("tenant commit failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "tenant commit failed")
 		return
 	}
+
 	writeJSON(w, http.StatusCreated, map[string]string{"id": tenantID})
 }
 
@@ -436,19 +683,27 @@ func (a *App) updateTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tenant id, name and phone are required")
 		return
 	}
+
 	tx, err := a.db.Begin(r.Context())
 	if err != nil {
+		a.logger.Error("transaction begin failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "transaction failed")
 		return
 	}
 	defer tx.Rollback(r.Context())
-	tag, err := tx.Exec(r.Context(), `UPDATE tenants SET full_name=$3, phone=$4, email=$5, national_id=$6, payment_method=$7, bank_name=$8, bank_account_number=$9, mpesa_paybill=$10, mpesa_account_number=$11 WHERE id=$1 AND organization_id=$2`, tenantID, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID, in.PaymentMethod, in.BankName, in.BankAccountNumber, in.MPesaPaybill, in.MPesaAccountNumber)
+
+	tag, err := tx.Exec(r.Context(), `UPDATE tenants SET full_name=$3, phone=$4, email=$5, national_id=$6, payment_method=$7, bank_name=$8, bank_account_number=$9, mpesa_paybill=$10, mpesa_account_number=$11, updated_at=now() WHERE id=$1 AND organization_id=$2`, tenantID, u.OrganizationID, in.FullName, in.Phone, in.Email, in.NationalID, in.PaymentMethod, in.BankName, in.BankAccountNumber, in.MPesaPaybill, in.MPesaAccountNumber)
 	if err != nil || tag.RowsAffected() == 0 {
+		a.logger.Error("tenant update failed", "error", err)
 		writeError(w, http.StatusNotFound, "tenant not found")
 		return
 	}
+
 	var oldUnitID string
-	_ = tx.QueryRow(r.Context(), `SELECT unit_id::text FROM leases WHERE tenant_id=$1 AND organization_id=$2 AND status='active' ORDER BY created_at DESC LIMIT 1`, tenantID, u.OrganizationID).Scan(&oldUnitID)
+	if err := tx.QueryRow(r.Context(), `SELECT unit_id::text FROM leases WHERE tenant_id=$1 AND organization_id=$2 AND status='active' ORDER BY created_at DESC LIMIT 1`, tenantID, u.OrganizationID).Scan(&oldUnitID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		a.logger.Warn("old unit lookup failed", "error", err)
+	}
+
 	if in.UnitID != "" {
 		var rentCents int64
 		if err := tx.QueryRow(r.Context(), `SELECT monthly_rent_cents FROM units WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID).Scan(&rentCents); err != nil {
@@ -461,26 +716,42 @@ func (a *App) updateTenant(w http.ResponseWriter, r *http.Request) {
 		if in.DueDay == 0 {
 			in.DueDay = 1
 		}
+
 		if oldUnitID != "" && oldUnitID != in.UnitID {
-			_, _ = tx.Exec(r.Context(), `UPDATE leases SET status='ended', ends_on=current_date WHERE tenant_id=$1 AND organization_id=$2 AND status='active'`, tenantID, u.OrganizationID)
-			_, _ = tx.Exec(r.Context(), `UPDATE units SET status='vacant' WHERE id=$1 AND organization_id=$2 AND NOT EXISTS (SELECT 1 FROM leases WHERE unit_id=$1 AND organization_id=$2 AND status='active')`, oldUnitID, u.OrganizationID)
+			if _, err := tx.Exec(r.Context(), `UPDATE leases SET status='ended', ends_on=current_date WHERE tenant_id=$1 AND organization_id=$2 AND status='active'`, tenantID, u.OrganizationID); err != nil {
+				a.logger.Warn("lease end failed", "error", err)
+			}
+			if _, err := tx.Exec(r.Context(), `UPDATE units SET status='vacant' WHERE id=$1 AND organization_id=$2 AND NOT EXISTS (SELECT 1 FROM leases WHERE unit_id=$1 AND organization_id=$2 AND status='active')`, oldUnitID, u.OrganizationID); err != nil {
+				a.logger.Warn("unit vacancy failed", "error", err)
+			}
 			oldUnitID = ""
 		}
+
 		if oldUnitID == "" {
-			_, err = tx.Exec(r.Context(), `INSERT INTO leases (organization_id,tenant_id,unit_id,starts_on,due_day,rent_cents) VALUES ($1,$2,$3,current_date,$4,$5)`, u.OrganizationID, tenantID, in.UnitID, in.DueDay, rentCents)
+			if _, err := tx.Exec(r.Context(), `INSERT INTO leases (organization_id,tenant_id,unit_id,starts_on,due_day,rent_cents) VALUES ($1,$2,$3,current_date,$4,$5)`, u.OrganizationID, tenantID, in.UnitID, in.DueDay, rentCents); err != nil {
+				a.logger.Error("lease insert failed", "error", err)
+				writeError(w, http.StatusBadRequest, "lease update failed")
+				return
+			}
 		} else {
-			_, err = tx.Exec(r.Context(), `UPDATE leases SET unit_id=$3, due_day=$4, rent_cents=$5 WHERE tenant_id=$1 AND organization_id=$2 AND status='active'`, tenantID, u.OrganizationID, in.UnitID, in.DueDay, rentCents)
+			if _, err := tx.Exec(r.Context(), `UPDATE leases SET unit_id=$3, due_day=$4, rent_cents=$5 WHERE tenant_id=$1 AND organization_id=$2 AND status='active'`, tenantID, u.OrganizationID, in.UnitID, in.DueDay, rentCents); err != nil {
+				a.logger.Error("lease update failed", "error", err)
+				writeError(w, http.StatusBadRequest, "lease update failed")
+				return
+			}
 		}
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "lease update failed")
-			return
+
+		if _, err := tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID); err != nil {
+			a.logger.Warn("unit occupied update failed", "error", err)
 		}
-		_, _ = tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, in.UnitID, u.OrganizationID)
 	}
+
 	if err := tx.Commit(r.Context()); err != nil {
+		a.logger.Error("tenant update commit failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "tenant update commit failed")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
@@ -491,16 +762,20 @@ func (a *App) createTenantAccessLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tenant id is required")
 		return
 	}
+
 	var exists bool
 	if err := a.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM tenants WHERE id=$1 AND organization_id=$2)`, tenantID, u.OrganizationID).Scan(&exists); err != nil || !exists {
 		writeError(w, http.StatusNotFound, "tenant not found")
 		return
 	}
+
 	token, err := a.tenantToken(u.OrganizationID, tenantID)
 	if err != nil {
+		a.logger.Error("tenant token create failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "tenant token create failed")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"url": strings.TrimRight(a.cfg.FrontendOrigin, "/") + "/tenant?token=" + url.QueryEscape(token), "expires_in_days": "30"})
 }
 
@@ -508,7 +783,9 @@ func (a *App) tenantImportTemplate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-tenant-import-template.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"full_name", "phone", "email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes", "payment_method", "bank_name", "bank_account_number", "mpesa_paybill", "mpesa_account_number"})
+	if err := cw.Write([]string{"full_name", "phone", "email", "national_id", "property_name", "property_address", "city", "unit_label", "monthly_rent_kes", "lease_start_date", "due_day", "deposit_kes", "payment_method", "bank_name", "bank_account_number", "mpesa_paybill", "mpesa_account_number"}); err != nil {
+		a.logger.Error("csv header write failed", "error", err)
+	}
 	cw.Flush()
 }
 
@@ -519,11 +796,13 @@ func (a *App) previewTenantImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
 	table, err := readImportTable(file, header)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	mapping := suggestTenantMapping(table.Headers)
 	result := validateTenantImport(table, attachHeaders(mapping, table.Headers), 10)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -546,11 +825,13 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
 	table, err := readImportTable(file, header)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	mapping := suggestTenantMapping(table.Headers)
 	if rawMapping := r.FormValue("mapping"); rawMapping != "" {
 		if err := json.Unmarshal([]byte(rawMapping), &mapping); err != nil {
@@ -564,6 +845,7 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "no valid tenant rows found", "validation": validation})
 		return
 	}
+
 	unitsToCreate := 0
 	for _, row := range table.Rows {
 		rec := tenantImportRecord(row, mapping)
@@ -577,8 +859,15 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	tx, _ := a.db.Begin(r.Context())
+
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		a.logger.Error("transaction begin failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "transaction failed")
+		return
+	}
 	defer tx.Rollback(r.Context())
+
 	imported := 0
 	var errs []string
 	for i, row := range table.Rows {
@@ -587,23 +876,27 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, fmt.Sprintf("row %d missing full_name or phone", i+2))
 			continue
 		}
+
 		var tenantID string
 		err := tx.QueryRow(r.Context(), `INSERT INTO tenants (organization_id,full_name,phone,email,national_id,payment_method,bank_name,bank_account_number,mpesa_paybill,mpesa_account_number) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, u.OrganizationID, rec.FullName, rec.Phone, rec.Email, rec.NationalID, rec.PaymentMethod, rec.BankName, rec.BankAccountNumber, rec.MPesaPaybill, rec.MPesaAccountNumber).Scan(&tenantID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("row %d: %v", i+2, err))
 			continue
 		}
+
 		if rec.PropertyName != "" && rec.UnitLabel != "" {
 			propertyID, err := ensureProperty(r.Context(), tx, u.OrganizationID, rec.PropertyName, rec.PropertyAddress, rec.City)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("row %d property: %v", i+2, err))
 				continue
 			}
+
 			unitID, err := ensureUnit(r.Context(), tx, u.OrganizationID, propertyID, rec.UnitLabel, rec.MonthlyRentCents)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("row %d unit: %v", i+2, err))
 				continue
 			}
+
 			startsOn := rec.LeaseStartDate
 			if startsOn == "" {
 				startsOn = time.Now().Format("2006-01-02")
@@ -616,17 +909,26 @@ func (a *App) importTenants(w http.ResponseWriter, r *http.Request) {
 				errs = append(errs, fmt.Sprintf("row %d lease: %v", i+2, err))
 				continue
 			}
-			_, _ = tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, unitID, u.OrganizationID)
+
+			if _, err := tx.Exec(r.Context(), `UPDATE units SET status='occupied' WHERE id=$1 AND organization_id=$2`, unitID, u.OrganizationID); err != nil {
+				a.logger.Warn("unit status update during import failed", "error", err)
+			}
 		}
+
 		imported++
 	}
-	errJSON, _ := json.Marshal(errs)
+
 	var jobID string
-	_ = tx.QueryRow(r.Context(), `INSERT INTO import_jobs (organization_id,kind,filename,total_rows,imported_rows,failed_rows,errors) VALUES ($1,'tenants',$2,$3,$4,$5,$6) RETURNING id`, u.OrganizationID, header.Filename, len(table.Rows), imported, len(errs), errJSON).Scan(&jobID)
+	if err := tx.QueryRow(r.Context(), `INSERT INTO import_jobs (organization_id,kind,filename,total_rows,imported_rows,failed_rows,errors) VALUES ($1,'tenants',$2,$3,$4,$5,$6) RETURNING id`, u.OrganizationID, header.Filename, len(table.Rows), imported, len(errs), toJSON(errs)).Scan(&jobID); err != nil {
+		a.logger.Error("import job record failed", "error", err)
+	}
+
 	if err := tx.Commit(r.Context()); err != nil {
+		a.logger.Error("import commit failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "import commit failed")
 		return
 	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{"id": jobID, "total_rows": len(table.Rows), "imported_rows": imported, "failed_rows": len(errs), "errors": errs})
 }
 
@@ -634,19 +936,32 @@ func (a *App) exportTenantsCSV(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	rows, err := a.db.Query(r.Context(), `SELECT full_name, phone, email, national_id, payment_method, bank_name, bank_account_number, mpesa_paybill, mpesa_account_number, created_at FROM tenants WHERE organization_id=$1 ORDER BY full_name`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("export query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "export failed")
 		return
 	}
 	defer rows.Close()
+
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-tenants.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"Full name", "Phone", "Email", "National ID", "Payment method", "Bank name", "Bank account number", "M-Pesa paybill", "M-Pesa account number", "Created at"})
+
+	if err := cw.Write([]string{"Full name", "Phone", "Email", "National ID", "Payment method", "Bank name", "Bank account number", "M-Pesa paybill", "M-Pesa account number", "Created at"}); err != nil {
+		a.logger.Error("csv header write failed", "error", err)
+		return
+	}
+
 	for rows.Next() {
 		var name, phone, email, nid, paymentMethod, bankName, bankAccountNumber, mpesaPaybill, mpesaAccountNumber string
 		var created time.Time
-		_ = rows.Scan(&name, &phone, &email, &nid, &paymentMethod, &bankName, &bankAccountNumber, &mpesaPaybill, &mpesaAccountNumber, &created)
-		_ = cw.Write([]string{name, phone, email, nid, paymentMethod, bankName, bankAccountNumber, mpesaPaybill, mpesaAccountNumber, created.Format(time.RFC3339)})
+		if err := rows.Scan(&name, &phone, &email, &nid, &paymentMethod, &bankName, &bankAccountNumber, &mpesaPaybill, &mpesaAccountNumber, &created); err != nil {
+			a.logger.Warn("row scan failed", "error", err)
+			continue
+		}
+		if err := cw.Write([]string{name, phone, email, nid, paymentMethod, bankName, bankAccountNumber, mpesaPaybill, mpesaAccountNumber, created.Format(time.RFC3339)}); err != nil {
+			a.logger.Warn("csv row write failed", "error", err)
+			break
+		}
 	}
 	cw.Flush()
 }
@@ -662,33 +977,49 @@ func (a *App) monthlyExcelReport(w http.ResponseWriter, r *http.Request) {
 		WHERE pi.organization_id=$1 AND pi.period_month=date_trunc('month', now())::date
 		ORDER BY pi.due_on, t.full_name`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("report query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "report query failed")
 		return
 	}
 	defer rows.Close()
+
 	f := excelize.NewFile()
 	sheet := "Monthly report"
 	f.SetSheetName("Sheet1", sheet)
 	headers := []any{"Tenant", "Property", "Unit", "Due on", "Amount KES", "Status"}
-	_ = f.SetSheetRow(sheet, "A1", &headers)
-	row := 2
+	if err := f.SetSheetRow(sheet, "A1", &headers); err != nil {
+		a.logger.Warn("excel header write failed", "error", err)
+	}
+
+	rowNum := 2
 	for rows.Next() {
 		var tenant, property, unit, status string
 		var due time.Time
 		var cents int64
-		_ = rows.Scan(&tenant, &property, &unit, &due, &cents, &status)
-		values := []any{tenant, property, unit, due.Format("2006-01-02"), money(cents), status}
-		_ = f.SetSheetRow(sheet, fmt.Sprintf("A%d", row), &values)
-		row++
+		if err := rows.Scan(&tenant, &property, &unit, &due, &cents, &status); err != nil {
+			a.logger.Warn("row scan failed", "error", err)
+			continue
+		}
+		values := []any{tenant, property, unit, due.Format("2006-01-02"), formatMoney(cents), status}
+		if err := f.SetSheetRow(sheet, fmt.Sprintf("A%d", rowNum), &values); err != nil {
+			a.logger.Warn("excel row write failed", "error", err)
+			continue
+		}
+		rowNum++
 	}
+
 	var buf bytes.Buffer
 	if err := f.Write(&buf); err != nil {
+		a.logger.Error("excel write failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "report generation failed")
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", `attachment; filename="rentpulse-monthly-report.xlsx"`)
-	_, _ = w.Write(buf.Bytes())
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		a.logger.Error("report response write failed", "error", err)
+	}
 }
 
 func (a *App) listPayments(w http.ResponseWriter, r *http.Request) {
@@ -712,6 +1043,7 @@ func (a *App) listPayments(w http.ResponseWriter, r *http.Request) {
 		WHERE pi.organization_id=$1
 		ORDER BY pi.due_on DESC, t.full_name`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("payments query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "payments query failed")
 		return
 	}
@@ -732,18 +1064,26 @@ func (a *App) markPaid(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "payment intent and transaction reference are required")
 		return
 	}
+
 	var tenantID string
 	err := a.db.QueryRow(r.Context(), `SELECT l.tenant_id FROM payment_intents pi JOIN leases l ON l.id=pi.lease_id WHERE pi.id=$1 AND pi.organization_id=$2`, in.PaymentIntentID, u.OrganizationID).Scan(&tenantID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "payment intent not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "payment intent not found")
+			return
+		}
+		a.logger.Error("payment lookup failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "payment lookup failed")
 		return
 	}
-	_, err = a.db.Exec(r.Context(), `INSERT INTO payment_confirmations (organization_id,payment_intent_id,tenant_id,amount_cents,provider,transaction_ref,evidence_url) VALUES ($1,$2,$3,$4,$5,$6,$7);
-		UPDATE payment_intents SET status='tenant_marked_paid' WHERE id=$2 AND organization_id=$1`, u.OrganizationID, in.PaymentIntentID, tenantID, in.AmountCents, in.Provider, in.TransactionRef, in.EvidenceURL)
-	if err != nil {
+
+	if _, err := a.db.Exec(r.Context(), `INSERT INTO payment_confirmations (organization_id,payment_intent_id,tenant_id,amount_cents,provider,transaction_ref,evidence_url) VALUES ($1,$2,$3,$4,$5,$6,$7);
+		UPDATE payment_intents SET status='tenant_marked_paid' WHERE id=$2 AND organization_id=$1`, u.OrganizationID, in.PaymentIntentID, tenantID, in.AmountCents, in.Provider, in.TransactionRef, in.EvidenceURL); err != nil {
+		a.logger.Error("payment confirmation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "payment confirmation failed")
 		return
 	}
+
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "pending_verification"})
 }
 
@@ -757,10 +1097,12 @@ func (a *App) tenantMe(w http.ResponseWriter, r *http.Request) {
 		WHERE pi.organization_id=$1 AND l.tenant_id=$2 AND pi.status IN ('due','overdue','tenant_marked_paid','rejected')
 		ORDER BY pi.due_on DESC`, u.OrganizationID, u.TenantID)
 	if err != nil {
+		a.logger.Error("tenant payment query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "tenant payment query failed")
 		return
 	}
 	defer rows.Close()
+
 	var tenant struct {
 		ID       string           `json:"id"`
 		FullName string           `json:"full_name"`
@@ -769,9 +1111,15 @@ func (a *App) tenantMe(w http.ResponseWriter, r *http.Request) {
 		Payments []map[string]any `json:"payments"`
 	}
 	if err := a.db.QueryRow(r.Context(), `SELECT id, full_name, phone, email FROM tenants WHERE id=$1 AND organization_id=$2`, u.TenantID, u.OrganizationID).Scan(&tenant.ID, &tenant.FullName, &tenant.Phone, &tenant.Email); err != nil {
-		writeError(w, http.StatusNotFound, "tenant not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "tenant not found")
+			return
+		}
+		a.logger.Error("tenant lookup failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "tenant lookup failed")
 		return
 	}
+
 	tenant.Payments = collect(rows)
 	writeJSON(w, http.StatusOK, tenant)
 }
@@ -782,38 +1130,50 @@ func (a *App) tenantUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "upload must be 8MB or smaller")
 		return
 	}
+
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "file field is required")
 		return
 	}
 	defer file.Close()
+
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".pdf" {
 		writeError(w, http.StatusBadRequest, "only jpg, png, or pdf evidence is accepted")
 		return
 	}
+
 	token, err := randomHex(16)
 	if err != nil {
+		a.logger.Error("file token generation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "file token failed")
 		return
 	}
+
 	dir := filepath.Join(a.cfg.UploadDir, u.OrganizationID, u.TenantID)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
+		a.logger.Error("upload directory creation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "upload directory failed")
 		return
 	}
+
 	path := filepath.Join(dir, token+ext)
 	out, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
 	if err != nil {
+		a.logger.Error("upload file creation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "upload create failed")
 		return
 	}
 	defer out.Close()
+
 	if _, err := io.Copy(out, io.LimitReader(file, 8<<20)); err != nil {
+		a.logger.Error("upload write failed", "error", err)
+		os.Remove(path)
 		writeError(w, http.StatusInternalServerError, "upload write failed")
 		return
 	}
+
 	publicPath := "/uploads/" + url.PathEscape(u.OrganizationID) + "/" + url.PathEscape(u.TenantID) + "/" + url.PathEscape(token+ext)
 	writeJSON(w, http.StatusCreated, map[string]string{"url": strings.TrimRight(a.cfg.PublicBaseURL, "/") + publicPath, "path": publicPath})
 }
@@ -831,24 +1191,33 @@ func (a *App) tenantMarkPaid(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "payment intent and transaction reference are required")
 		return
 	}
+
 	var expectedAmount int64
 	err := a.db.QueryRow(r.Context(), `SELECT pi.amount_cents
 		FROM payment_intents pi
 		JOIN leases l ON l.id=pi.lease_id
 		WHERE pi.id=$1 AND pi.organization_id=$2 AND l.tenant_id=$3`, in.PaymentIntentID, u.OrganizationID, u.TenantID).Scan(&expectedAmount)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "payment intent not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "payment intent not found")
+			return
+		}
+		a.logger.Error("payment intent lookup failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "payment intent lookup failed")
 		return
 	}
+
 	if in.AmountCents <= 0 {
 		in.AmountCents = expectedAmount
 	}
-	_, err = a.db.Exec(r.Context(), `INSERT INTO payment_confirmations (organization_id,payment_intent_id,tenant_id,amount_cents,provider,transaction_ref,evidence_url) VALUES ($1,$2,$3,$4,$5,$6,$7);
-		UPDATE payment_intents SET status='tenant_marked_paid' WHERE id=$2 AND organization_id=$1`, u.OrganizationID, in.PaymentIntentID, u.TenantID, in.AmountCents, in.Provider, in.TransactionRef, in.EvidenceURL)
-	if err != nil {
+
+	if _, err := a.db.Exec(r.Context(), `INSERT INTO payment_confirmations (organization_id,payment_intent_id,tenant_id,amount_cents,provider,transaction_ref,evidence_url) VALUES ($1,$2,$3,$4,$5,$6,$7);
+		UPDATE payment_intents SET status='tenant_marked_paid' WHERE id=$2 AND organization_id=$1`, u.OrganizationID, in.PaymentIntentID, u.TenantID, in.AmountCents, in.Provider, in.TransactionRef, in.EvidenceURL); err != nil {
+		a.logger.Error("payment confirmation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "payment confirmation failed")
 		return
 	}
+
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "pending_landlord_verification"})
 }
 
@@ -856,6 +1225,7 @@ func (a *App) verifyPayment(w http.ResponseWriter, r *http.Request) {
 	u := mustUser(r)
 	var in struct {
 		PaymentIntentID string `json:"payment_intent_id"`
+		ConfirmationID  string `json:"confirmation_id"`
 		TransactionRef  string `json:"transaction_ref"`
 		Approve         bool   `json:"approve"`
 	}
@@ -863,9 +1233,11 @@ func (a *App) verifyPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "payment intent is required")
 		return
 	}
+
 	if in.Approve && in.TransactionRef != "" && a.cfg.MPesaConsumerKey != "" {
 		ok, err := a.verifyMPesaReference(r.Context(), in.TransactionRef)
 		if err != nil {
+			a.logger.Error("mpesa verification failed", "error", err)
 			writeError(w, http.StatusBadGateway, "mpesa verification failed: "+err.Error())
 			return
 		}
@@ -874,18 +1246,42 @@ func (a *App) verifyPayment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
 	status := "rejected"
 	intentStatus := "rejected"
 	if in.Approve {
 		status = "verified"
 		intentStatus = "verified"
 	}
-	_, err := a.db.Exec(r.Context(), `UPDATE payment_confirmations SET verification_status=$3, verified_by=$4, verified_at=now() WHERE payment_intent_id=$1 AND organization_id=$2 AND verification_status='pending';
-		UPDATE payment_intents SET status=$5 WHERE id=$1 AND organization_id=$2`, in.PaymentIntentID, u.OrganizationID, status, u.ID, intentStatus)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "verification update failed")
+
+	var rowsAffected int64
+	if in.ConfirmationID != "" {
+		tag, err := a.db.Exec(r.Context(), `UPDATE payment_confirmations SET verification_status=$3, verified_by=$4, verified_at=now() WHERE id=$1 AND payment_intent_id=$2 AND organization_id=$5 AND verification_status='pending'`, in.ConfirmationID, in.PaymentIntentID, status, u.ID, u.OrganizationID)
+		if err != nil {
+			a.logger.Error("confirmation update failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "verification update failed")
+			return
+		}
+		rowsAffected = tag.RowsAffected()
+	} else {
+		tag, err := a.db.Exec(r.Context(), `UPDATE payment_confirmations SET verification_status=$3, verified_by=$4, verified_at=now() WHERE payment_intent_id=$1 AND organization_id=$2 AND verification_status='pending'`, in.PaymentIntentID, u.OrganizationID, status, u.ID)
+		if err != nil {
+			a.logger.Error("confirmation update failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "verification update failed")
+			return
+		}
+		rowsAffected = tag.RowsAffected()
+	}
+
+	if rowsAffected == 0 {
+		writeError(w, http.StatusNotFound, "no pending confirmation found")
 		return
 	}
+
+	if _, err := a.db.Exec(r.Context(), `UPDATE payment_intents SET status=$2 WHERE id=$1 AND organization_id=$3`, in.PaymentIntentID, intentStatus, u.OrganizationID); err != nil {
+		a.logger.Error("payment intent status update failed", "error", err)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": intentStatus})
 }
 
@@ -900,28 +1296,38 @@ func (a *App) runReminders(w http.ResponseWriter, r *http.Request) {
 		JOIN organization_settings s ON s.organization_id=pi.organization_id
 		WHERE pi.organization_id=$1 AND pi.status IN ('due','overdue','tenant_marked_paid')`, u.OrganizationID)
 	if err != nil {
+		a.logger.Error("reminder query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "reminder query failed")
 		return
 	}
 	defer rows.Close()
+
 	sent, failed, skipped := 0, 0, 0
 	for rows.Next() {
 		var intentID, tenantID, tenant, phone, property, unit, status, template, escalation string
 		var amount int64
 		var due time.Time
-		_ = rows.Scan(&intentID, &tenantID, &tenant, &phone, &property, &unit, &amount, &due, &status, &template, &escalation)
+		if err := rows.Scan(&intentID, &tenantID, &tenant, &phone, &property, &unit, &amount, &due, &status, &template, &escalation); err != nil {
+			a.logger.Warn("reminder row scan failed", "error", err)
+			continue
+		}
+
 		if status == "tenant_marked_paid" {
 			continue
 		}
+
 		body := template
 		if status == "overdue" {
 			body = escalation
 		}
+
 		link := ""
 		if token, err := a.tenantToken(u.OrganizationID, tenantID); err == nil {
 			link = strings.TrimRight(a.cfg.FrontendOrigin, "/") + "/tenant?token=" + url.QueryEscape(token)
 		}
-		body = render(body, map[string]string{"tenant": tenant, "amount": "KES " + money(amount), "unit": property + " " + unit, "due_date": due.Format("2 Jan 2006"), "tenant_link": link})
+
+		body = render(body, map[string]string{"tenant": tenant, "amount": "KES " + formatMoney(amount), "unit": property + " " + unit, "due_date": due.Format("2 Jan 2006"), "tenant_link": link})
+
 		msgID, sendErr := a.sendMessage(r.Context(), "sms", phone, body)
 		commStatus, errText := "sent", ""
 		if errors.Is(sendErr, errProviderNotConfigured) {
@@ -935,8 +1341,12 @@ func (a *App) runReminders(w http.ResponseWriter, r *http.Request) {
 		} else {
 			sent++
 		}
-		_, _ = a.db.Exec(r.Context(), `INSERT INTO communications (organization_id,tenant_id,payment_intent_id,channel,recipient,body,status,provider_message_id,error,sent_at) VALUES ($1,$2,$3,'sms',$4,$5,$6,$7,$8,CASE WHEN $6='sent' THEN now() ELSE NULL END)`, u.OrganizationID, tenantID, intentID, phone, body, commStatus, msgID, errText)
+
+		if _, err := a.db.Exec(r.Context(), `INSERT INTO communications (organization_id,tenant_id,payment_intent_id,channel,recipient,body,status,provider_message_id,error,sent_at) VALUES ($1,$2,$3,'sms',$4,$5,$6,$7,$8,CASE WHEN $6='sent' THEN now() ELSE NULL END)`, u.OrganizationID, tenantID, intentID, phone, body, commStatus, msgID, errText); err != nil {
+			a.logger.Error("communication log failed", "error", err)
+		}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]int{"sent": sent, "failed": failed, "skipped": skipped})
 }
 
@@ -946,149 +1356,314 @@ func (a *App) sendMessage(ctx context.Context, channel, recipient, body string) 
 	if a.cfg.TwilioAccountSID == "" || a.cfg.TwilioAuthToken == "" || a.cfg.TwilioFromSMS == "" {
 		return "", errProviderNotConfigured
 	}
+
 	form := url.Values{}
 	form.Set("To", recipient)
 	form.Set("From", a.cfg.TwilioFromSMS)
 	form.Set("Body", body)
 	endpoint := "https://api.twilio.com/2010-04-01/Accounts/" + a.cfg.TwilioAccountSID + "/Messages.json"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("create twilio request: %w", err)
+	}
 	req.SetBasicAuth(a.cfg.TwilioAccountSID, a.cfg.TwilioAuthToken)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("twilio request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
 	var out struct {
 		SID     string `json:"sid"`
 		Message string `json:"message"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode twilio response: %w", err)
+	}
+
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("twilio returned %d: %s", resp.StatusCode, out.Message)
 	}
+
 	return out.SID, nil
 }
 
 func (a *App) verifyMPesaReference(ctx context.Context, ref string) (bool, error) {
-	tokenReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.MPesaBaseURL+"/oauth/v1/generate?grant_type=client_credentials", nil)
+	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.MPesaBaseURL+"/oauth/v1/generate?grant_type=client_credentials", nil)
+	if err != nil {
+		return false, fmt.Errorf("create mpesa token request: %w", err)
+	}
 	tokenReq.SetBasicAuth(a.cfg.MPesaConsumerKey, a.cfg.MPesaSecret)
+
 	tokenResp, err := http.DefaultClient.Do(tokenReq)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("mpesa token request failed: %w", err)
 	}
 	defer tokenResp.Body.Close()
+
 	var token struct {
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.NewDecoder(tokenResp.Body).Decode(&token); err != nil {
-		return false, err
+		return false, fmt.Errorf("decode mpesa token response: %w", err)
 	}
+
 	if tokenResp.StatusCode >= 300 || token.AccessToken == "" {
 		return false, fmt.Errorf("oauth status %d", tokenResp.StatusCode)
 	}
+
 	passwordSeed := a.cfg.MPesaShortCode + "RentPulse" + time.Now().Format("20060102150405")
 	sum := hmac.New(sha256.New, []byte(a.cfg.MPesaSecret))
 	sum.Write([]byte(passwordSeed))
 	signature := base64.StdEncoding.EncodeToString(sum.Sum(nil))
-	payload := map[string]string{"TransactionID": ref, "PartyA": a.cfg.MPesaShortCode, "IdentifierType": "4", "ResultURL": "https://example.com/mpesa/result", "QueueTimeOutURL": "https://example.com/mpesa/timeout", "Remarks": "RentPulse verification", "Occasion": "Rent verification", "SecurityCredential": signature, "CommandID": "TransactionStatusQuery"}
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.MPesaBaseURL+"/mpesa/transactionstatus/v1/query", bytes.NewReader(body))
+
+	payload := map[string]string{
+		"TransactionID":     ref,
+		"PartyA":            a.cfg.MPesaShortCode,
+		"IdentifierType":    "4",
+		"ResultURL":         "https://example.com/mpesa/result",
+		"QueueTimeOutURL":   "https://example.com/mpesa/timeout",
+		"Remarks":           "RentPulse verification",
+		"Occasion":          "Rent verification",
+		"SecurityCredential": signature,
+		"CommandID":         "TransactionStatusQuery",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("marshal mpesa payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.MPesaBaseURL+"/mpesa/transactionstatus/v1/query", bytes.NewReader(body))
+	if err != nil {
+		return false, fmt.Errorf("create mpesa status request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("mpesa status request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
 	var out map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, fmt.Errorf("decode mpesa status response: %w", err)
+	}
+
 	if resp.StatusCode >= 300 {
 		return false, fmt.Errorf("transaction status returned %d", resp.StatusCode)
 	}
+
 	code, _ := out["ResponseCode"].(string)
 	return code == "0", nil
 }
 
-func (a *App) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		if !strings.HasPrefix(header, "Bearer ") {
-			writeError(w, http.StatusUnauthorized, "missing bearer token")
-			return
-		}
-		token, err := jwt.ParseWithClaims(strings.TrimPrefix(header, "Bearer "), jwt.MapClaims{}, func(token *jwt.Token) (any, error) {
-			return []byte(a.cfg.JWTSecret), nil
-		})
-		if err != nil || !token.Valid {
-			writeError(w, http.StatusUnauthorized, "invalid token")
-			return
-		}
-		claims := token.Claims.(jwt.MapClaims)
-		u := authUser{ID: fmt.Sprint(claims["sub"]), OrganizationID: fmt.Sprint(claims["org"]), Email: fmt.Sprint(claims["email"]), Role: fmt.Sprint(claims["role"]), FullName: fmt.Sprint(claims["name"]), TenantID: fmt.Sprint(claims["tenant_id"])}
-		if !a.allowRequest(r.Context(), u.OrganizationID) {
-			writeError(w, http.StatusTooManyRequests, "plan request limit reached; retry in a minute or upgrade your plan")
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
-	})
-}
-
-func (a *App) tenantAuth(next http.Handler) http.Handler {
-	return a.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u := mustUser(r)
-		if u.Role != "tenant" || u.TenantID == "" || u.TenantID == "<nil>" {
-			writeError(w, http.StatusForbidden, "tenant portal token required")
-			return
-		}
-		next.ServeHTTP(w, r)
-	}))
-}
-
-func (a *App) staffAuth(next http.Handler) http.Handler {
-	return a.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u := mustUser(r)
-		if u.Role == "tenant" {
-			writeError(w, http.StatusForbidden, "staff account required")
-			return
-		}
-		next.ServeHTTP(w, r)
-	}))
-}
-
 func (a *App) token(u authUser) (string, error) {
-	claims := jwt.MapClaims{"sub": u.ID, "org": u.OrganizationID, "email": u.Email, "role": u.Role, "name": u.FullName, "exp": time.Now().Add(24 * time.Hour).Unix(), "iat": time.Now().Unix()}
+	claims := jwt.MapClaims{
+		"sub":   u.ID,
+		"org":   u.OrganizationID,
+		"email": u.Email,
+		"role":  u.Role,
+		"name":  u.FullName,
+		"exp":   time.Now().Add(15 * time.Minute).Unix(),
+		"iat":   time.Now().Unix(),
+	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.cfg.JWTSecret))
 }
 
 func (a *App) tenantToken(orgID, tenantID string) (string, error) {
-	claims := jwt.MapClaims{"sub": tenantID, "tenant_id": tenantID, "org": orgID, "role": "tenant", "exp": time.Now().Add(30 * 24 * time.Hour).Unix(), "iat": time.Now().Unix()}
+	claims := jwt.MapClaims{
+		"sub":       tenantID,
+		"tenant_id": tenantID,
+		"org":       orgID,
+		"role":      "tenant",
+		"exp":       time.Now().Add(30 * 24 * time.Hour).Unix(),
+		"iat":       time.Now().Unix(),
+	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.cfg.JWTSecret))
 }
 
-func (a *App) cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", a.cfg.FrontendOrigin)
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+func (a *App) allowRequest(ctx context.Context, orgID string) bool {
+	if a.db == nil || a.rateLimiter == nil {
+		return true
+	}
+	plan := a.organizationPlan(ctx, orgID)
+	limit := planRequestsPerMinute(plan)
+	key := orgID + ":" + plan
+
+	allowed, err := a.rateLimiter.allow(ctx, a.db, key, limit)
+	if err != nil {
+		a.logger.Warn("rate limiter check failed, allowing request", "error", err)
+		return true
+	}
+	return allowed
 }
 
-func (a *App) recover(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				a.logger.Error("panic", "error", err)
-				writeError(w, http.StatusInternalServerError, "internal server error")
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
+func (a *App) enforceUnitCapacity(ctx context.Context, orgID string, additional int) error {
+	limit := planUnitLimit(a.organizationPlan(ctx, orgID))
+	if limit < 0 {
+		return nil
+	}
+
+	var current int
+	if err := a.db.QueryRow(ctx, `SELECT count(*) FROM units WHERE organization_id=$1`, orgID).Scan(&current); err != nil {
+		return fmt.Errorf("unit count query: %w", err)
+	}
+	if current+additional > limit {
+		return fmt.Errorf("current plan allows %d unit(s); upgrade in Settings to add more", limit)
+	}
+	return nil
+}
+
+func (a *App) organizationPlan(ctx context.Context, orgID string) string {
+	var plan string
+	if err := a.db.QueryRow(ctx, `SELECT plan FROM organizations WHERE id=$1`, orgID).Scan(&plan); err != nil || plan == "" {
+		return "free"
+	}
+	return plan
+}
+
+func (a *App) recordLoginAttempt(ctx context.Context, email, ip string, success bool) {
+	if _, err := a.db.Exec(ctx, `INSERT INTO login_attempts (email, ip_address, success) VALUES ($1, $2, $3)`, email, ip, success); err != nil {
+		a.logger.Warn("login attempt record failed", "error", err)
+	}
+}
+
+func (a *App) getFailedLoginAttempts(ctx context.Context, email, ip string) (int, error) {
+	if a.db == nil {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-15 * time.Minute)
+	var count int
+	err := a.db.QueryRow(ctx, `SELECT count(*) FROM login_attempts WHERE email = $1 AND ip_address = $2 AND success = false AND attempted_at > $3`, email, ip, cutoff).Scan(&count)
+	return count, err
+}
+
+func (a *App) createRefreshToken(ctx context.Context, userID, ip, userAgent string) (string, string, error) {
+	rawToken, err := randomHex(32)
+	if err != nil {
+		return "", "", fmt.Errorf("generate refresh token: %w", err)
+	}
+
+	tokenHash := hashToken(rawToken)
+	expiresAt := time.Now().Add(7 * 24 * time.Hour)
+
+	if _, err := a.db.Exec(ctx, `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, ip_address, user_agent) VALUES ($1, $2, $3, $4, $5)`, userID, tokenHash, expiresAt, ip, userAgent); err != nil {
+		return "", "", fmt.Errorf("save refresh token: %w", err)
+	}
+
+	return rawToken, tokenHash, nil
+}
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum)
+}
+
+func planUnitLimit(plan string) int {
+	switch plan {
+	case "agency":
+		return -1
+	case "pro":
+		return 10
+	default:
+		return 2
+	}
+}
+
+func planRequestsPerMinute(plan string) int {
+	switch plan {
+	case "agency":
+		return 1000
+	case "pro":
+		return 300
+	case "starter":
+		return 120
+	default:
+		return 60
+	}
+}
+
+func toJSON(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+
+func parseInt(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	n, _ := strconv.Atoi(value)
+	return n
+}
+
+func parseKESCents(value string) int64 {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, ",", "")
+	value = strings.TrimPrefix(strings.ToLower(value), "kes")
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	amount, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0
+	}
+	return int64(amount * 100)
+}
+
+func normalizePaymentMethod(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "bank", "bank transfer", "bank deposit", "transfer":
+		return "bank"
+	case "mpesa", "m pesa", "m pesa paybill", "mpesa paybill", "paybill", "mpesa_paybill":
+		return "mpesa_paybill"
+	default:
+		return value
+	}
+}
+
+func normalizeHeader(header string) string {
+	header = strings.ToLower(strings.TrimSpace(header))
+	header = strings.ReplaceAll(header, "_", " ")
+	header = strings.ReplaceAll(header, "-", " ")
+	header = strings.Join(strings.Fields(header), " ")
+	return header
+}
+
+func ensureProperty(ctx context.Context, tx pgx.Tx, orgID, name, address, city string) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM properties WHERE organization_id=$1 AND lower(name)=lower($2) LIMIT 1`, orgID, name).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO properties (organization_id,name,address,city) VALUES ($1,$2,$3,$4) RETURNING id`, orgID, name, address, city).Scan(&id)
+	return id, err
+}
+
+func ensureUnit(ctx context.Context, tx pgx.Tx, orgID, propertyID, label string, rentCents int64) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM units WHERE organization_id=$1 AND property_id=$2 AND lower(label)=lower($3) LIMIT 1`, orgID, propertyID, label).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents,status) VALUES ($1,$2,$3,$4,'vacant') RETURNING id`, orgID, propertyID, label, rentCents).Scan(&id)
+	return id, err
 }
 
 type importTable struct {
@@ -1128,31 +1703,34 @@ func readImportTable(file multipart.File, header *multipart.FileHeader) (importT
 	if strings.HasSuffix(name, ".xlsx") {
 		tmp, err := io.ReadAll(file)
 		if err != nil {
-			return importTable{}, err
+			return importTable{}, fmt.Errorf("read xlsx file: %w", err)
 		}
 		xl, err := excelize.OpenReader(bytes.NewReader(tmp))
 		if err != nil {
-			return importTable{}, err
+			return importTable{}, fmt.Errorf("parse xlsx file: %w", err)
 		}
 		sheet := xl.GetSheetName(0)
 		rows, err = xl.GetRows(sheet)
 		if err != nil {
-			return importTable{}, err
+			return importTable{}, fmt.Errorf("read xlsx rows: %w", err)
 		}
 	} else {
 		parsed, err := csv.NewReader(file).ReadAll()
 		if err != nil {
-			return importTable{}, err
+			return importTable{}, fmt.Errorf("parse csv file: %w", err)
 		}
 		rows = parsed
 	}
+
 	if len(rows) < 2 {
 		return importTable{}, errors.New("file must include a header row and at least one tenant")
 	}
+
 	headers := make([]string, len(rows[0]))
-	for i, header := range rows[0] {
-		headers[i] = strings.TrimSpace(header)
+	for i, h := range rows[0] {
+		headers[i] = strings.TrimSpace(h)
 	}
+
 	var data [][]string
 	for _, row := range rows[1:] {
 		normalized := make([]string, len(headers))
@@ -1169,6 +1747,7 @@ func readImportTable(file multipart.File, header *multipart.FileHeader) (importT
 			data = append(data, normalized)
 		}
 	}
+
 	return importTable{Headers: headers, Rows: data}, nil
 }
 
@@ -1192,6 +1771,7 @@ func suggestTenantMapping(headers []string) map[string]string {
 		"mpesa_paybill":        {"mpesa_paybill", "m-pesa paybill", "mpesa paybill", "paybill"},
 		"mpesa_account_number": {"mpesa_account_number", "m-pesa account number", "mpesa account", "mpesa account number", "paybill account"},
 	}
+
 	mapping := map[string]string{}
 	for field, names := range aliases {
 		for _, header := range headers {
@@ -1218,10 +1798,12 @@ func validateTenantImport(table importTable, mapping map[string]string, limit in
 	if mapping["phone"] == "" {
 		result.Errors = append(result.Errors, "Map a column to phone")
 	}
+
 	max := len(table.Rows)
 	if limit > 0 && limit < max {
 		max = limit
 	}
+
 	for i := 0; i < max; i++ {
 		rec := tenantImportRecord(table.Rows[i], mapping)
 		rowErrs := validateTenantRecord(rec)
@@ -1289,6 +1871,7 @@ func tenantImportRecord(row []string, mapping map[string]string) tenantImport {
 		}
 		return strings.TrimSpace(row[index])
 	}
+
 	return tenantImport{
 		FullName:           get("full_name"),
 		Phone:              get("phone"),
@@ -1332,196 +1915,4 @@ func firstRows(rows [][]string, n int) [][]string {
 		return rows
 	}
 	return rows[:n]
-}
-
-func normalizeHeader(header string) string {
-	header = strings.ToLower(strings.TrimSpace(header))
-	header = strings.ReplaceAll(header, "_", " ")
-	header = strings.ReplaceAll(header, "-", " ")
-	header = strings.Join(strings.Fields(header), " ")
-	return header
-}
-
-func parseKESCents(value string) int64 {
-	value = strings.TrimSpace(value)
-	value = strings.ReplaceAll(value, ",", "")
-	value = strings.TrimPrefix(strings.ToLower(value), "kes")
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0
-	}
-	amount, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return 0
-	}
-	return int64(amount * 100)
-}
-
-func parseInt(value string) int {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0
-	}
-	n, _ := strconv.Atoi(value)
-	return n
-}
-
-func normalizePaymentMethod(value string) string {
-	value = normalizeHeader(value)
-	switch value {
-	case "bank", "bank transfer", "bank deposit", "transfer":
-		return "bank"
-	case "mpesa", "m pesa", "m pesa paybill", "mpesa paybill", "paybill", "mpesa_paybill":
-		return "mpesa_paybill"
-	default:
-		return value
-	}
-}
-
-func ensureProperty(ctx context.Context, tx pgx.Tx, orgID, name, address, city string) (string, error) {
-	var id string
-	err := tx.QueryRow(ctx, `SELECT id FROM properties WHERE organization_id=$1 AND lower(name)=lower($2) LIMIT 1`, orgID, name).Scan(&id)
-	if err == nil {
-		return id, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", err
-	}
-	err = tx.QueryRow(ctx, `INSERT INTO properties (organization_id,name,address,city) VALUES ($1,$2,$3,$4) RETURNING id`, orgID, name, address, city).Scan(&id)
-	return id, err
-}
-
-func ensureUnit(ctx context.Context, tx pgx.Tx, orgID, propertyID, label string, rentCents int64) (string, error) {
-	var id string
-	err := tx.QueryRow(ctx, `SELECT id FROM units WHERE organization_id=$1 AND property_id=$2 AND lower(label)=lower($3) LIMIT 1`, orgID, propertyID, label).Scan(&id)
-	if err == nil {
-		return id, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", err
-	}
-	err = tx.QueryRow(ctx, `INSERT INTO units (organization_id,property_id,label,monthly_rent_cents,status) VALUES ($1,$2,$3,$4,'vacant') RETURNING id`, orgID, propertyID, label, rentCents).Scan(&id)
-	return id, err
-}
-
-func (a *App) allowRequest(ctx context.Context, orgID string) bool {
-	plan := a.organizationPlan(ctx, orgID)
-	limit := planRequestsPerMinute(plan)
-	key := orgID + ":" + plan
-	now := time.Now()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	bucket := a.limits[key]
-	if bucket == nil || now.Sub(bucket.WindowStart) >= time.Minute {
-		a.limits[key] = &rateBucket{WindowStart: now, Count: 1}
-		return true
-	}
-	if bucket.Count >= limit {
-		return false
-	}
-	bucket.Count++
-	return true
-}
-
-func (a *App) enforceUnitCapacity(ctx context.Context, orgID string, additional int) error {
-	limit := planUnitLimit(a.organizationPlan(ctx, orgID))
-	if limit < 0 {
-		return nil
-	}
-	var current int
-	if err := a.db.QueryRow(ctx, `SELECT count(*) FROM units WHERE organization_id=$1`, orgID).Scan(&current); err != nil {
-		return err
-	}
-	if current+additional > limit {
-		return fmt.Errorf("current plan allows %d unit(s); upgrade in Settings to add more", limit)
-	}
-	return nil
-}
-
-func (a *App) organizationPlan(ctx context.Context, orgID string) string {
-	var plan string
-	if err := a.db.QueryRow(ctx, `SELECT plan FROM organizations WHERE id=$1`, orgID).Scan(&plan); err != nil || plan == "" {
-		return "free"
-	}
-	return plan
-}
-
-func planUnitLimit(plan string) int {
-	switch plan {
-	case "agency":
-		return -1
-	case "pro":
-		return 10
-	default:
-		return 2
-	}
-}
-
-func planRequestsPerMinute(plan string) int {
-	switch plan {
-	case "agency":
-		return 1000
-	case "pro":
-		return 300
-	case "starter":
-		return 120
-	default:
-		return 60
-	}
-}
-
-func collect(rows pgx.Rows) []map[string]any {
-	fields := rows.FieldDescriptions()
-	out := []map[string]any{}
-	for rows.Next() {
-		values, _ := rows.Values()
-		item := map[string]any{}
-		for i, f := range fields {
-			item[string(f.Name)] = values[i]
-		}
-		out = append(out, item)
-	}
-	return out
-}
-
-func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return false
-	}
-	return true
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}
-
-func mustUser(r *http.Request) authUser {
-	return r.Context().Value(userKey).(authUser)
-}
-
-func money(cents int64) string {
-	return strconv.FormatFloat(float64(cents)/100, 'f', 2, 64)
-}
-
-func render(template string, values map[string]string) string {
-	for key, value := range values {
-		template = strings.ReplaceAll(template, "{{"+key+"}}", value)
-	}
-	return template
-}
-
-func randomHex(n int) (string, error) {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", buf), nil
 }

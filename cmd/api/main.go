@@ -32,7 +32,7 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := store.Migrate(ctx, db, migrations, "migrations/001_init.sql"); err != nil {
+	if err := store.Migrate(ctx, db, migrations, "migrations"); err != nil {
 		logger.Error("database migration failed", "error", err)
 		os.Exit(1)
 	}
@@ -60,4 +60,5 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("api shutdown failed", "error", err)
 	}
+	logger.Info("api shut down gracefully")
 }

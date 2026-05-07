@@ -7,3 +7,7 @@ coverage/
 .DS_Store
 postgres_data/
 uploads/
+bin/
+*.exe
+*.bin
+rentpulse

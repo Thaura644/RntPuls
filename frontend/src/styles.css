@@ -127,6 +127,21 @@ th { font-size: .72rem; text-transform: uppercase; letter-spacing: .09em; color:
 .validationBox p { margin: .35rem 0; }
 .previewTable { max-height: 320px; overflow: auto; border: 1px solid rgba(187,202,191,.28); border-radius: 10px; background: white; }
 .previewTable table { min-width: 900px; }
+.pagination { display: flex; justify-content: center; align-items: center; gap: 1rem; padding: 1.5rem 0; }
+.pagination span { color: rgba(11,28,48,.55); font-weight: 800; font-size: .85rem; }
+.pagination button:disabled { opacity: .4; cursor: not-allowed; }
+
+.skeleton { display: grid; gap: .75rem; padding: 1rem 0; }
+.skeletonLine { height: 20px; border-radius: 6px; background: linear-gradient(90deg, #e8ecf4 25%, #f0f4fc 50%, #e8ecf4 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; }
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+.searchActive { display: flex; align-items: center; gap: .5rem; width: 100%; }
+.searchActive input { border: 0; background: transparent; box-shadow: none; padding: .5rem 0; }
+.searchActive input:focus { border: 0; box-shadow: none; }
+.searchPlaceholder { color: rgba(11,28,48,.45); font-weight: 600; font-size: .85rem; }
+
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
 @media (max-width: 980px) {
   .hero, .app { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; }

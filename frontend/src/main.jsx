@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Bell, Building2, CheckCircle2, Download, FileSpreadsheet, Home, LogOut, MessageSquareText, Plus, Search, Settings, ShieldCheck, Upload, Users, WalletCards } from 'lucide-react';
+import { Bell, Building2, CheckCircle2, Download, FileSpreadsheet, Home, LogOut, MessageSquareText, Plus, Search, Settings, ShieldCheck, Upload, Users, WalletCards, X } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8080/api';
@@ -82,7 +82,7 @@ class ErrorBoundary extends React.Component {
   render() {
     if (this.state.error) {
       return (
-        <main className="authPage">
+        <main className="site">
           <section className="authCard">
             <strong className="brand">RentPulse</strong>
             <h1>Something needs attention</h1>
@@ -136,20 +136,26 @@ function Auth({ onLogin, onBack }) {
   const [mode, setMode] = useState('register');
   const [form, setForm] = useState({ organization_name: '', full_name: '', email: '', phone: '', password: '' });
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
   async function submit(e) {
     e.preventDefault();
     setError('');
+    setLoading(true);
     try {
       const path = mode === 'register' ? '/auth/register' : '/auth/login';
       const body = mode === 'register' ? form : { email: form.email, password: form.password };
       const out = await request(path, { method: 'POST', body: JSON.stringify(body) });
       onLogin(out.token);
     } catch (err) {
-      if (mode === 'register' && err.message.includes('already registered')) {
+      if (err.message.includes('already registered')) {
         setError('That email already has an account. Switch to sign in below.');
+      } else if (err.message.includes('too many')) {
+        setError('Too many attempts. Please wait a moment and try again.');
       } else {
         setError(err.message);
       }
+    } finally {
+      setLoading(false);
     }
   }
   return (
@@ -164,7 +170,7 @@ function Auth({ onLogin, onBack }) {
         {mode === 'register' && <input placeholder="Phone" value={form.phone} onChange={e => setForm({ ...form, phone: e.target.value })} />}
         <input placeholder="Password" type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
         {error && <p className="error">{error}</p>}
-        <button className="btn primary">{mode === 'register' ? 'Create account' : 'Sign in'}</button>
+        <button className="btn primary" disabled={loading}>{loading ? 'Please wait...' : (mode === 'register' ? 'Create account' : 'Sign in')}</button>
         <button type="button" className="linkButton" onClick={() => setMode(mode === 'register' ? 'login' : 'register')}>{mode === 'register' ? 'I already have an account' : 'Create a new account'}</button>
       </form>
     </main>
@@ -178,6 +184,8 @@ function Shell({ children, route, setRoute, user, logout }) {
     ['payments', WalletCards, 'Payments'],
     ['settings', Settings, 'Settings']
   ];
+  const [search, setSearch] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
   return (
     <div className="app">
       <aside className="sidebar">
@@ -187,11 +195,46 @@ function Shell({ children, route, setRoute, user, logout }) {
       </aside>
       <section className="workspace">
         <header className="appbar">
-          <div className="search"><Search size={18} /><input placeholder="Search tenants, units, payments..." /></div>
+          <div className="search">
+            {searchOpen ? (
+              <div className="searchActive">
+                <Search size={18} />
+                <input autoFocus placeholder="Search tenants, units, payments..." value={search} onChange={e => setSearch(e.target.value)} onKeyDown={e => e.key === 'Escape' && setSearchOpen(false)} />
+                <button className="linkButton" onClick={() => { setSearchOpen(false); setSearch(''); }}><X size={16} /></button>
+              </div>
+            ) : (
+              <button className="linkButton" onClick={() => setSearchOpen(true)}><Search size={18} /><span className="searchPlaceholder">Search...</span></button>
+            )}
+          </div>
           <div className="userbar"><Bell size={20} /><span>{user?.FullName || user?.full_name || 'Owner'}</span><button onClick={logout} title="Log out"><LogOut size={18} /></button></div>
         </header>
-        {children}
+        {React.Children.map(children, child => {
+          if (React.isValidElement(child)) {
+            return React.cloneElement(child, { searchQuery: search });
+          }
+          return child;
+        })}
       </section>
+    </div>
+  );
+}
+
+function usePaginatedData(items, pageSize = 20) {
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const start = (currentPage - 1) * pageSize;
+  const paginated = items.slice(start, start + pageSize);
+  return { items: paginated, page: currentPage, totalPages, setPage };
+}
+
+function Pagination({ page, totalPages, setPage }) {
+  if (totalPages <= 1) return null;
+  return (
+    <div className="pagination">
+      <button className="btn ghost" disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button>
+      <span>Page {page} of {totalPages}</span>
+      <button className="btn ghost" disabled={page >= totalPages} onClick={() => setPage(page + 1)}>Next</button>
     </div>
   );
 }
@@ -199,7 +242,11 @@ function Shell({ children, route, setRoute, user, logout }) {
 function Dashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  useEffect(() => { request('/dashboard').then(setData).catch(e => setError(e.message)); }, []);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    request('/dashboard').then(d => { setData(d); setError(''); }).catch(e => setError(e.message)).finally(() => setLoading(false));
+  }, []);
+  if (loading) return <Page title="Dashboard"><Skeleton count={4} /></Page>;
   if (error) return <Page title="Dashboard"><p className="error">{error}</p></Page>;
   if (!data) return <Page title="Dashboard"><p>Loading live portfolio...</p></Page>;
   const pct = data.total_due_cents ? Math.round((data.collected_cents / data.total_due_cents) * 100) : 0;
@@ -220,7 +267,11 @@ function Dashboard() {
   );
 }
 
-function Tenants() {
+function Skeleton({ count = 3 }) {
+  return <div className="skeleton">{Array.from({ length: count }).map((_, i) => <div key={i} className="skeletonLine" />)}</div>;
+}
+
+function Tenants({ searchQuery = '' }) {
   const [tenants, setTenants] = useState([]);
   const [properties, setProperties] = useState([]);
   const [units, setUnits] = useState([]);
@@ -229,7 +280,9 @@ function Tenants() {
   const [notice, setNotice] = useState('');
   const [importOpen, setImportOpen] = useState(false);
   const [editing, setEditing] = useState(null);
-  const load = () => {
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
     setError('');
     return Promise.all([
       request('/tenants'),
@@ -239,23 +292,29 @@ function Tenants() {
       setTenants(Array.isArray(tenantData) ? tenantData : []);
       setProperties(Array.isArray(propertyData) ? propertyData : []);
       setUnits(Array.isArray(unitData) ? unitData : []);
-    }).catch(e => setError(e.message));
-  };
-  useEffect(() => {
-    load();
+    }).catch(e => setError(e.message)).finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => { load(); }, [load]);
+
   async function add(e) {
     e.preventDefault();
     setError('');
     await request('/tenants', { method: 'POST', body: JSON.stringify(form) }).then(() => { setForm({ full_name: '', phone: '', email: '' }); load(); }).catch(e => setError(e.message));
   }
+
   async function copyTenantLink(tenantID) {
     setError('');
     const out = await request(`/tenants/${tenantID}/access-link`, { method: 'POST', body: '{}' }).catch(e => setError(e.message));
     if (!out) return;
-    await navigator.clipboard.writeText(out.url);
-    setNotice('Tenant portal link copied. Send it by SMS or WhatsApp.');
+    try {
+      await navigator.clipboard.writeText(out.url);
+      setNotice('Tenant portal link copied. Send it by SMS or WhatsApp.');
+    } catch {
+      setNotice('Copy the link from the response: ' + out.url);
+    }
   }
+
   function startEdit(tenant) {
     setEditing({
       id: tenant.id,
@@ -266,6 +325,7 @@ function Tenants() {
       unit_id: tenant.unit_id || ''
     });
   }
+
   async function saveEdit() {
     setError('');
     const selectedUnit = units.find(unit => unit.id === editing.unit_id);
@@ -285,9 +345,23 @@ function Tenants() {
       load();
     }
   }
+
   function unitsForProperty(propertyID) {
     return units.filter(unit => unit.property_id === propertyID);
   }
+
+  const filtered = tenants.filter(t => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return (t.full_name || '').toLowerCase().includes(q) ||
+           (t.phone || '').includes(q) ||
+           (t.email || '').toLowerCase().includes(q) ||
+           (t.unit_label || '').toLowerCase().includes(q) ||
+           (t.property_name || '').toLowerCase().includes(q);
+  });
+
+  const { items: paginated, page, totalPages, setPage } = usePaginatedData(filtered);
+
   return (
     <Page title="Resident directory" subtitle="Tenant records come from the API. Add one manually or import a CSV/XLSX file.">
       <form className="inlineForm" onSubmit={add}>
@@ -303,26 +377,31 @@ function Tenants() {
         <a className="btn ghost" href={`${API}/reports/monthly.xlsx`} onClick={(e) => attachTokenDownload(e, '/reports/monthly.xlsx')}><FileSpreadsheet size={18} />Excel report</a>
       </div>
       {error && <p className="error">{error}</p>}{notice && <p className="notice">{notice}</p>}
-      <section className="panel tablePanel">
-        {tenants.length === 0 ? <Empty title="No tenants yet" text="Create or import tenants to populate your ledger." /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th><th>Tenant access</th><th>Actions</th></tr></thead><tbody>{tenants.map(t => {
-          const isEditing = editing?.id === t.id;
-          const rowPropertyID = isEditing ? editing.property_id : t.property_id;
-          const rowUnitID = isEditing ? editing.unit_id : t.unit_id;
-          const rowUnit = units.find(unit => unit.id === rowUnitID);
-          return (
-            <tr key={t.id}>
-              <td>{isEditing ? <input value={editing.full_name} onChange={e => setEditing({ ...editing, full_name: e.target.value })} /> : t.full_name}</td>
-              <td>{isEditing ? <input value={editing.phone} onChange={e => setEditing({ ...editing, phone: e.target.value })} /> : t.phone}</td>
-              <td>{isEditing ? <input value={editing.email} onChange={e => setEditing({ ...editing, email: e.target.value })} /> : t.email}</td>
-              <td>{isEditing ? <select value={editing.property_id} onChange={e => setEditing({ ...editing, property_id: e.target.value, unit_id: '' })}><option value="">Choose property</option>{properties.map(property => <option key={property.id} value={property.id}>{property.name}</option>)}</select> : t.property_name}</td>
-              <td>{isEditing ? <select value={editing.unit_id} disabled={!editing.property_id} onChange={e => setEditing({ ...editing, unit_id: e.target.value })}><option value="">Choose unit</option>{unitsForProperty(editing.property_id).map(unit => <option key={unit.id} value={unit.id}>{unit.label} · {kes(unit.monthly_rent_cents || 0)}</option>)}</select> : t.unit_label}</td>
-              <td>{kes((isEditing ? rowUnit?.monthly_rent_cents : t.rent_cents) || 0)}</td>
-              <td><button className="linkButton" onClick={() => copyTenantLink(t.id)}>Copy link</button></td>
-              <td>{isEditing ? <div className="rowActions"><button className="linkButton" onClick={saveEdit}>Save</button><button className="linkButton muted" onClick={() => setEditing(null)}>Cancel</button></div> : <button className="linkButton" onClick={() => startEdit(t)}>Edit</button>}</td>
-            </tr>
-          );
-        })}</tbody></table>}
-      </section>
+      {loading ? <Skeleton count={5} /> : (
+        <>
+          <section className="panel tablePanel">
+            {paginated.length === 0 ? <Empty title={searchQuery ? "No matching tenants" : "No tenants yet"} text={searchQuery ? "Try a different search term." : "Create or import tenants to populate your ledger."} /> : <table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Property</th><th>Unit</th><th>Rent</th><th>Tenant access</th><th>Actions</th></tr></thead><tbody>{paginated.map(t => {
+              const isEditing = editing?.id === t.id;
+              const rowPropertyID = isEditing ? editing.property_id : t.property_id;
+              const rowUnitID = isEditing ? editing.unit_id : t.unit_id;
+              const rowUnit = units.find(unit => unit.id === rowUnitID);
+              return (
+                <tr key={t.id}>
+                  <td>{isEditing ? <input value={editing.full_name} onChange={e => setEditing({ ...editing, full_name: e.target.value })} /> : t.full_name}</td>
+                  <td>{isEditing ? <input value={editing.phone} onChange={e => setEditing({ ...editing, phone: e.target.value })} /> : t.phone}</td>
+                  <td>{isEditing ? <input value={editing.email} onChange={e => setEditing({ ...editing, email: e.target.value })} /> : t.email}</td>
+                  <td>{isEditing ? <select value={editing.property_id} onChange={e => setEditing({ ...editing, property_id: e.target.value, unit_id: '' })}><option value="">Choose property</option>{properties.map(property => <option key={property.id} value={property.id}>{property.name}</option>)}</select> : t.property_name}</td>
+                  <td>{isEditing ? <select value={editing.unit_id} disabled={!editing.property_id} onChange={e => setEditing({ ...editing, unit_id: e.target.value })}><option value="">Choose unit</option>{unitsForProperty(editing.property_id).map(unit => <option key={unit.id} value={unit.id}>{unit.label} · {kes(unit.monthly_rent_cents || 0)}</option>)}</select> : t.unit_label}</td>
+                  <td>{kes((isEditing ? rowUnit?.monthly_rent_cents : t.rent_cents) || 0)}</td>
+                  <td><button className="linkButton" onClick={() => copyTenantLink(t.id)}>Copy link</button></td>
+                  <td>{isEditing ? <div className="rowActions"><button className="linkButton" onClick={saveEdit}>Save</button><button className="linkButton muted" onClick={() => setEditing(null)}>Cancel</button></div> : <button className="linkButton" onClick={() => startEdit(t)}>Edit</button>}</td>
+                </tr>
+              );
+            })}</tbody></table>}
+          </section>
+          <Pagination page={page} totalPages={totalPages} setPage={setPage} />
+        </>
+      )}
       {importOpen && <ImportWizard onClose={() => setImportOpen(false)} onImported={(summary) => { setNotice(`Imported ${summary.imported_rows} of ${summary.total_rows} rows`); setImportOpen(false); load(); }} />}
     </Page>
   );
@@ -443,15 +522,14 @@ function TenantPortal({ token }) {
   const [form, setForm] = useState({ provider: 'mpesa', transaction_ref: '', evidence_url: '' });
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
 
   function load() {
     setError('');
-    return request('/tenant/me', { token }).then(setData).catch(e => setError(e.message));
+    return request('/tenant/me', { token }).then(d => { setData(d); setError(''); }).catch(e => setError(e.message)).finally(() => setLoading(false));
   }
 
-  useEffect(() => {
-    load();
-  }, [token]);
+  useEffect(() => { load(); }, [token]);
 
   async function upload(e) {
     const file = e.target.files[0];
@@ -492,7 +570,7 @@ function TenantPortal({ token }) {
       <section className="tenantGrid">
         <div className="panel">
           <h2>Open payments</h2>
-          {!data ? <p>Loading...</p> : data.payments.length === 0 ? <Empty title="No open payments" text="There are no due or overdue rent items assigned to this portal link." /> : data.payments.map(payment => (
+          {loading ? <p>Loading...</p> : !data ? <p>No data available</p> : data.payments.length === 0 ? <Empty title="No open payments" text="There are no due or overdue rent items assigned to this portal link." /> : data.payments.map(payment => (
             <button key={payment.id} className={selected?.id === payment.id ? 'paymentChoice selected' : 'paymentChoice'} onClick={() => setSelected(payment)}>
               <span>{payment.property_name} {payment.unit_label}</span>
               <strong>{kes(payment.amount_cents)}</strong>
@@ -513,33 +591,53 @@ function TenantPortal({ token }) {
   );
 }
 
-function Payments() {
+function Payments({ searchQuery = '' }) {
   const [payments, setPayments] = useState([]);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
   useEffect(() => {
-    request('/payments').then(data => setPayments(Array.isArray(data) ? data : [])).catch(e => setError(e.message));
+    request('/payments').then(data => { setPayments(Array.isArray(data) ? data : []); setError(''); }).catch(e => setError(e.message)).finally(() => setLoading(false));
   }, []);
+
+  const filtered = payments.filter(p => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return (p.tenant_name || '').toLowerCase().includes(q) ||
+           (p.tenant_phone || '').includes(q) ||
+           (p.unit_label || '').toLowerCase().includes(q) ||
+           (p.property_name || '').toLowerCase().includes(q) ||
+           (p.transaction_ref || '').toLowerCase().includes(q) ||
+           (p.status || '').toLowerCase().includes(q);
+  });
+
+  const { items: paginated, page, totalPages, setPage } = usePaginatedData(filtered);
+
   return (
     <Page title="Payments" subtitle="Track due, overdue, submitted, and verified rent payments from the live ledger.">
       {error && <p className="error">{error}</p>}
-      <section className="panel tablePanel">
-        {payments.length === 0 ? <Empty title="No payments yet" text="Payment items are created when active leases exist for the current month." /> : (
-          <table>
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Due on</th><th>Amount</th><th>Status</th><th>Reference</th><th>Evidence</th></tr></thead>
-            <tbody>{payments.map(payment => (
-              <tr key={payment.id}>
-                <td>{payment.tenant_name}<br /><small>{payment.tenant_phone}</small></td>
-                <td>{payment.property_name} {payment.unit_label}</td>
-                <td>{payment.due_on ? new Date(payment.due_on).toLocaleDateString() : ''}</td>
-                <td>{kes(payment.amount_cents || 0)}</td>
-                <td><span className={`status ${payment.status}`}>{payment.status}</span></td>
-                <td>{payment.transaction_ref}</td>
-                <td>{payment.evidence_url ? <a className="evidenceLink" href={payment.evidence_url} target="_blank">Open</a> : ''}</td>
-              </tr>
-            ))}</tbody>
-          </table>
-        )}
-      </section>
+      {loading ? <Skeleton count={5} /> : (
+        <>
+          <section className="panel tablePanel">
+            {paginated.length === 0 ? <Empty title={searchQuery ? "No matching payments" : "No payments yet"} text={searchQuery ? "Try a different search term." : "Payment items are created when active leases exist for the current month."} /> : (
+              <table>
+                <thead><tr><th>Tenant</th><th>Unit</th><th>Due on</th><th>Amount</th><th>Status</th><th>Reference</th><th>Evidence</th></tr></thead>
+                <tbody>{paginated.map(payment => (
+                  <tr key={payment.id}>
+                    <td>{payment.tenant_name}<br /><small>{payment.tenant_phone}</small></td>
+                    <td>{payment.property_name} {payment.unit_label}</td>
+                    <td>{payment.due_on ? new Date(payment.due_on).toLocaleDateString() : ''}</td>
+                    <td>{kes(payment.amount_cents || 0)}</td>
+                    <td><span className={`status ${payment.status}`}>{payment.status}</span></td>
+                    <td>{payment.transaction_ref}</td>
+                    <td>{payment.evidence_url ? <a className="evidenceLink" href={payment.evidence_url} target="_blank">Open</a> : ''}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </section>
+          <Pagination page={page} totalPages={totalPages} setPage={setPage} />
+        </>
+      )}
     </Page>
   );
 }
@@ -559,7 +657,8 @@ function SettingsPage() {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [tab, setTab] = useState('general');
-  useEffect(() => { request('/settings').then(setForm).catch(e => setError(e.message)); }, []);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => { request('/settings').then(d => { setForm(d); setError(''); }).catch(e => setError(e.message)).finally(() => setLoading(false)); }, []);
   async function save(e) {
     e.preventDefault();
     setNotice('');
@@ -569,6 +668,7 @@ function SettingsPage() {
     const out = await request('/communications/reminders/run', { method: 'POST', body: '{}' }).catch(e => setError(e.message));
     if (out) setNotice(`Reminder run complete: ${out.sent} sent, ${out.skipped} skipped, ${out.failed} failed`);
   }
+  if (loading) return <Page title="Settings"><Skeleton count={3} /></Page>;
   if (!form) return <Page title="Settings"><p>{error || 'Loading settings...'}</p></Page>;
   return (
     <Page title="Settings" subtitle={`Current plan: ${form.plan}. Configure operations, properties, units, and billing.`}>

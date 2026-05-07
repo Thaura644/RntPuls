@@ -17,13 +17,16 @@ type Config struct {
 	MPesaShortCode   string
 	UploadDir        string
 	PublicBaseURL    string
+	BcryptCost       int
+	JWTExpiryHours   int
+	Env              string
 }
 
 func Load() Config {
 	return Config{
 		Port:             env("PORT", "8080"),
 		DatabaseURL:      env("DATABASE_URL", "postgres://rentpulse:rentpulse@localhost:5432/rentpulse?sslmode=disable"),
-		JWTSecret:        env("JWT_SECRET", "dev-change-me"),
+		JWTSecret:        env("JWT_SECRET", ""),
 		FrontendOrigin:   env("FRONTEND_ORIGIN", "http://localhost:5173"),
 		TwilioAccountSID: env("TWILIO_ACCOUNT_SID", ""),
 		TwilioAuthToken:  env("TWILIO_AUTH_TOKEN", ""),
@@ -35,6 +38,9 @@ func Load() Config {
 		MPesaShortCode:   env("MPESA_SHORT_CODE", ""),
 		UploadDir:        env("UPLOAD_DIR", "uploads"),
 		PublicBaseURL:    env("PUBLIC_BASE_URL", "http://localhost:8080"),
+		BcryptCost:       parseInt(env("BCRYPT_COST", "12")),
+		JWTExpiryHours:   parseInt(env("JWT_EXPIRY_HOURS", "1")),
+		Env:              env("APP_ENV", "development"),
 	}
 }
 
@@ -43,4 +49,15 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func parseInt(value string) int {
+	n := 0
+	for _, c := range value {
+		if c < '0' || c > '9' {
+			return n
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

@@ -1,0 +1,27 @@
+{
+	auto_https on
+}
+
+:80 {
+	redir https://{host}{uri} permanent
+}
+
+:443 {
+	tls internal
+
+	encode gzip
+
+	@api path /api/*
+	handle @api {
+		reverse_header X-Forwarded-Proto https
+		reverse_header X-Forwarded-For {remote}
+		reverse_header X-Real-IP {remote}
+		reverse_header X-Request-ID {>X-Request-ID}
+		reverse_api http://api:8080
+	}
+
+	handle {
+		reverse_header X-Forwarded-Proto https
+		reverse_web http://web:80
+	}
+}

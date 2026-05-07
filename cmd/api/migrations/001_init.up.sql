@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE IF NOT EXISTS organizations (
+CREATE TABLE organizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
   plan TEXT NOT NULL DEFAULT 'free' CHECK (plan IN ('free','starter','pro','agency')),
@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS organizations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   email TEXT NOT NULL UNIQUE,
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS properties (
+CREATE TABLE properties (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS properties (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS units (
+CREATE TABLE units (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   property_id UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS units (
   UNIQUE(property_id, label)
 );
 
-CREATE TABLE IF NOT EXISTS tenants (
+CREATE TABLE tenants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   full_name TEXT NOT NULL,
@@ -54,13 +54,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT '';
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS bank_name TEXT NOT NULL DEFAULT '';
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS bank_account_number TEXT NOT NULL DEFAULT '';
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mpesa_paybill TEXT NOT NULL DEFAULT '';
-ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mpesa_account_number TEXT NOT NULL DEFAULT '';
-
-CREATE TABLE IF NOT EXISTS leases (
+CREATE TABLE leases (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -74,7 +68,7 @@ CREATE TABLE IF NOT EXISTS leases (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS payment_intents (
+CREATE TABLE payment_intents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   lease_id UUID NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
@@ -86,7 +80,7 @@ CREATE TABLE IF NOT EXISTS payment_intents (
   UNIQUE(lease_id, period_month)
 );
 
-CREATE TABLE IF NOT EXISTS payment_confirmations (
+CREATE TABLE payment_confirmations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
@@ -101,7 +95,7 @@ CREATE TABLE IF NOT EXISTS payment_confirmations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS communications (
+CREATE TABLE communications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
@@ -118,7 +112,7 @@ CREATE TABLE IF NOT EXISTS communications (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS organization_settings (
+CREATE TABLE organization_settings (
   organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
   mpesa_paybill TEXT NOT NULL DEFAULT '',
   mpesa_till TEXT NOT NULL DEFAULT '',
@@ -129,7 +123,7 @@ CREATE TABLE IF NOT EXISTS organization_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS import_jobs (
+CREATE TABLE import_jobs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
@@ -141,8 +135,8 @@ CREATE TABLE IF NOT EXISTS import_jobs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_units_org ON units(organization_id);
-CREATE INDEX IF NOT EXISTS idx_tenants_org ON tenants(organization_id);
-CREATE INDEX IF NOT EXISTS idx_leases_org_status ON leases(organization_id, status);
-CREATE INDEX IF NOT EXISTS idx_payment_intents_org_status ON payment_intents(organization_id, status);
-CREATE INDEX IF NOT EXISTS idx_communications_org_status ON communications(organization_id, status);
+CREATE INDEX idx_units_org ON units(organization_id);
+CREATE INDEX idx_tenants_org ON tenants(organization_id);
+CREATE INDEX idx_leases_org_status ON leases(organization_id, status);
+CREATE INDEX idx_payment_intents_org_status ON payment_intents(organization_id, status);
+CREATE INDEX idx_communications_org_status ON communications(organization_id, status);

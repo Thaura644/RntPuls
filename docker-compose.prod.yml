@@ -3,22 +3,25 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: rentpulse
-      POSTGRES_USER: rentpulse
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-rentpulse_secure_change_me}
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${DB_USER:-rentpulse}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rentpulse -d rentpulse"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-rentpulse}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    networks:
+      - backend
     deploy:
       resources:
         limits:
           memory: 512M
+        reservations:
+          memory: 256M
+    restart: always
 
   api:
     build:
@@ -26,29 +29,26 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       PORT: "8080"
-      DATABASE_URL: postgres://rentpulse:${DB_PASSWORD:-rentpulse_secure_change_me}@db:5432/rentpulse?sslmode=disable
+      DATABASE_URL: postgres://${DB_USER:-rentpulse}:${DB_PASSWORD}@db:5432/rentpulse?sslmode=disable
       JWT_SECRET: ${JWT_SECRET}
-      FRONTEND_ORIGIN: http://localhost:5173
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
       TWILIO_FROM_SMS: ${TWILIO_FROM_SMS:-}
-      TWILIO_FROM_WHATSAPP: ${TWILIO_FROM_WHATSAPP:-}
-      MPESA_BASE_URL: ${MPESA_BASE_URL:-https://sandbox.safaricom.co.ke}
+      MPESA_BASE_URL: ${MPESA_BASE_URL:-https://api.safaricom.co.ke}
       MPESA_CONSUMER_KEY: ${MPESA_CONSUMER_KEY:-}
       MPESA_CONSUMER_SECRET: ${MPESA_CONSUMER_SECRET:-}
       MPESA_SHORT_CODE: ${MPESA_SHORT_CODE:-}
       UPLOAD_DIR: /app/uploads
-      PUBLIC_BASE_URL: http://localhost:8080
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       BCRYPT_COST: "12"
       JWT_EXPIRY_HOURS: "1"
       APP_ENV: production
-    ports:
-      - "8080:8080"
     volumes:
       - uploads:/app/uploads
-    depends_on:
-      db:
-        condition: service_healthy
+    networks:
+      - backend
+      - frontend
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 30s
@@ -59,18 +59,19 @@ services:
       resources:
         limits:
           memory: 256M
-    restart: unless-stopped
+        reservations:
+          memory: 128M
+      replicas: 1
+    restart: always
 
   web:
     build:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: http://localhost:8080/api
-    ports:
-      - "5173:80"
-    depends_on:
-      - api
+        VITE_API_URL: /api
+    networks:
+      - frontend
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:80"]
       interval: 30s
@@ -80,8 +81,32 @@ services:
       resources:
         limits:
           memory: 64M
-    restart: unless-stopped
+    restart: always
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./scripts/Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - frontend
+    depends_on:
+      - web
+      - api
+    restart: always
 
 volumes:
   postgres_data:
   uploads:
+  caddy_data:
+  caddy_config:
+
+networks:
+  backend:
+    driver: bridge
+  frontend:
+    driver: bridge
