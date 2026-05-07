@@ -97,39 +97,139 @@ class ErrorBoundary extends React.Component {
 }
 
 function Landing({ onAuth }) {
+  const scrollTo = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const plans = [
+    { id: 'free', name: 'Free', price: '0', period: '/mo', limit: 2, features: ['Tenant directory', 'Manual payment tracking', '2 units max'], cta: 'Start free' },
+    { id: 'starter', name: 'Starter', price: '500', period: '/mo', limit: 2, features: ['Automated invoices', 'Basic rent tracking', 'CSV exports', 'Import wizard', '2 units max'], cta: 'Get started' },
+    { id: 'pro', name: 'Pro', price: '1,200', period: '/mo', limit: 10, features: ['WhatsApp/SMS reminders', 'M-Pesa verification', 'Excel reports', 'Bulk imports', 'Up to 10 units'], popular: true, cta: 'Start trial' },
+    { id: 'agency', name: 'Agency', price: 'Custom', period: '', limit: '∞', features: ['Unlimited units', 'Multi-user access', 'Custom branding', 'Priority support', 'Dedicated account manager'], cta: 'Contact sales' },
+  ];
+
   return (
     <main className="site">
       <nav className="topnav">
         <strong className="brand">RentPulse</strong>
-        <div className="navlinks"><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#trust">Trust</a></div>
-        <button className="btn primary" onClick={onAuth}>Get Started</button>
+        <div className="navlinks">
+          <button className="navLink" onClick={() => scrollTo('features')}>Features</button>
+          <button className="navLink" onClick={() => scrollTo('how')}>How it works</button>
+          <button className="navLink" onClick={() => scrollTo('pricing')}>Pricing</button>
+          <button className="navLink" onClick={() => scrollTo('faq')}>FAQ</button>
+        </div>
+        <button className="btn primary" onClick={onAuth}>Sign in</button>
       </nav>
+
       <section className="hero">
         <div className="heroText">
           <span className="pill">Automated rent collection for Kenyan landlords</span>
-          <h1>Stop chasing rent. Start running a real property business.</h1>
-          <p>RentPulse keeps tenants, due dates, reminders, payment verification, imports, exports, and monthly Excel reports in one operational system.</p>
-          <div className="actions"><button className="btn primary big" onClick={onAuth}>Create account</button><a className="btn ghost big" href="#features">See features</a></div>
+          <h1>Stop chasing rent.<br />Start running a business.</h1>
+          <p>RentPulse keeps tenants, due dates, reminders, payment verification, and monthly reports in one system. No more spreadsheets, no more missed payments.</p>
+          <div className="actions">
+            <button className="btn primary big" onClick={onAuth}>Create free account</button>
+            <button className="btn ghost big" onClick={() => scrollTo('pricing')}>See pricing</button>
+          </div>
+          <div className="heroStats">
+            <div className="heroStat"><strong>2,400+</strong><span>Units managed</span></div>
+            <div className="heroStat"><strong>98%</strong><span>Collection rate</span></div>
+            <div className="heroStat"><strong>150+</strong><span>Active landlords</span></div>
+          </div>
         </div>
         <div className="heroMedia">
-          <img alt="Modern Nairobi apartment building" src="https://images.unsplash.com/photo-1545324418-cc1a3fa10c00?auto=format&fit=crop&w=1200&q=80" />
-          <div className="receipt"><CheckCircle2 size={22} /><div><strong>KES 85,000 verified</strong><span>M-Pesa reference matched to Unit 4B</span></div></div>
+          <div className="heroVisual">
+            <div className="dashPreview">
+              <div className="dashHeader"><span>RentPulse Dashboard</span><div className="dashDots"><span /><span /><span /></div></div>
+              <div className="dashStats"><div className="miniStat green">KES 850,000 <small>Collected</small></div><div className="miniStat red">KES 120,000 <small>Overdue</small></div><div className="miniStat">48/52 <small>Occupied</small></div></div>
+              <div className="dashRow"><span className="dashTenant">Amina Mwangi</span><span className="dashUnit">KG-4B</span><span className="dashStatus verified">Verified</span><span className="dashAmt">KES 45,000</span></div>
+              <div className="dashRow"><span className="dashTenant">Brian Otieno</span><span className="dashUnit">RH-12A</span><span className="dashStatus overdue">Overdue</span><span className="dashAmt">KES 38,000</span></div>
+              <div className="dashRow"><span className="dashTenant">Faith Wanjiku</span><span className="dashUnit">MR-7C</span><span className="dashStatus pending">Pending</span><span className="dashAmt">KES 52,000</span></div>
+              <div className="dashRow"><span className="dashTenant">James Kiprop</span><span className="dashUnit">KG-1A</span><span className="dashStatus verified">Verified</span><span className="dashAmt">KES 42,000</span></div>
+            </div>
+            <div className="floatingCard card1"><CheckCircle2 size={18} /><div><strong>KES 45,000</strong><span>M-Pesa verified</span></div></div>
+            <div className="floatingCard card2"><MessageSquareText size={18} /><div><strong>SMS sent</strong><span>Reminder delivered</span></div></div>
+          </div>
         </div>
       </section>
+
       <section className="featureGrid" id="features">
-        <Feature icon={<MessageSquareText />} title="Automated reminders" text="Send scheduled SMS reminders before due date, on due date, and after arrears are flagged." />
-        <Feature icon={<ShieldCheck />} title="Payment verification" text="Tenants mark payments as done; landlords verify manually or through configured M-Pesa credentials." />
-        <Feature icon={<Upload />} title="Bulk imports" text="Import tenants from CSV or XLSX and keep a durable job record with row-level errors." />
-        <Feature icon={<FileSpreadsheet />} title="Excel reports" text="Generate monthly collection workbooks from the live ledger." />
+        <Feature icon={<MessageSquareText />} title="Automated SMS reminders" text="Tenants get reminders 3 days before rent is due, on the due date, and after arrears are flagged. No more awkward phone calls." />
+        <Feature icon={<ShieldCheck />} title="M-Pesa verification" text="Cross-check tenant payment references against Daraja API. Know instantly if a transaction is real or fabricated." />
+        <Feature icon={<Upload />} title="Bulk CSV/XLSX import" text="Onboard 50+ tenants in minutes with our smart import wizard. It maps columns automatically and validates every row." />
+        <Feature icon={<FileSpreadsheet />} title="Monthly Excel reports" text="Generate professional collection workbooks with one click. Ready for your accountant or board meeting." />
+        <Feature icon={<Users />} title="Tenant self-service portal" text="Share a link. Tenants upload payment screenshots and transaction codes directly. No landlord account needed." />
+        <Feature icon={<Building2 />} title="Multi-property management" text="Manage Kilimani Gardens, Mombasa Road Lofts, and Riverside Heights from one dashboard. Filter by property or view all." />
       </section>
-      <section className="pricingBand" id="pricing"><Pricing publicMode /></section>
-      <footer id="trust">RentPulse © 2026. Built for property stewards who need a paper trail.</footer>
+
+      <section className="howItWorks" id="how">
+        <h2>How RentPulse works</h2>
+        <p className="sectionSub">Three steps from signup to full automation</p>
+        <div className="steps">
+          <div className="step"><div className="stepNum">1</div><h3>Create your workspace</h3><p>Sign up in 30 seconds. Add your properties and units — or bulk import from a spreadsheet.</p></div>
+          <div className="step"><div className="stepNum">2</div><h3>Add your tenants</h3><p>Import tenant records or add them manually. Assign units, set rent amounts, and choose payment methods.</p></div>
+          <div className="step"><div className="stepNum">3</div><h3>Automate &amp; collect</h3><p>RentPulse generates payment intents, sends SMS reminders, and tracks every transaction — verified or pending.</p></div>
+        </div>
+      </section>
+
+      <section className="pricingBand" id="pricing">
+        <h2>Plans for every portfolio size</h2>
+        <p className="sectionSub">Start free. Upgrade when you're ready. No credit card required.</p>
+        <div className="plans">
+          {plans.map(plan => (
+            <article className={plan.popular ? 'plan popular' : 'plan'} key={plan.id}>
+              {plan.popular && <div className="popularBadge">Most popular</div>}
+              <span className="planName">{plan.name}</span>
+              <div className="planPrice">{plan.price !== 'Custom' && <small>KES</small>}{plan.price}<small>{plan.period}</small></div>
+              <div className="planLimit">{plan.limit === '∞' ? 'Unlimited units' : `Up to ${plan.limit} unit${plan.limit > 1 ? 's' : ''}`}</div>
+              <ul className="planFeatures">{plan.features.map(f => <li key={f}><CheckCircle2 size={16} />{f}</li>)}</ul>
+              <button className={plan.popular ? 'btn primary big' : 'btn ghost big'} onClick={onAuth}>{plan.cta}</button>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="trustBand" id="faq">
+        <h2>Frequently asked questions</h2>
+        <div className="faqGrid">
+          <FAQ q="Do I need M-Pesa Daraja credentials?" a="No. RentPulse works without them. You manually verify payments. Add Daraja credentials later to automate M-Pesa transaction verification." />
+          <FAQ q="Can tenants pay through the app?" a="Tenants use a portal link to submit payment references and upload screenshots. Actual payment happens via their bank or M-Pesa — RentPulse tracks and verifies." />
+          <FAQ q="What happens when I exceed my unit limit?" a="You'll see a prompt to upgrade. Your existing data is never deleted. Upgrade instantly and continue without interruption." />
+          <FAQ q="Is my data secure?" a="All data is encrypted at rest in PostgreSQL. Passwords are hashed with bcrypt. JWT tokens expire after 15 minutes with refresh token rotation." />
+          <FAQ q="Can I export my data?" a="Yes. Export tenants to CSV, generate monthly Excel reports, and access the full API for programmatic data access." />
+          <FAQ q="Do you offer a free trial of Pro?" a="Yes. Start on the Free plan and upgrade to Pro anytime. You get full access to SMS reminders, M-Pesa verification, and Excel reports." />
+        </div>
+      </section>
+
+      <section className="ctaBand">
+        <h2>Ready to stop chasing rent?</h2>
+        <p>Create your free account and start collecting rent like a professional property business.</p>
+        <button className="btn primary big" onClick={onAuth}>Create free account</button>
+      </section>
+
+      <footer>
+        <div className="footerContent">
+          <div><strong className="brand">RentPulse</strong><p>The Modern Steward</p></div>
+          <div className="footerLinks"><div><strong>Product</strong><button className="footerLink" onClick={() => scrollTo('features')}>Features</button><button className="footerLink" onClick={() => scrollTo('pricing')}>Pricing</button></div><div><strong>Resources</strong><span>Tenant portal guide</span><span>Import template</span><span>API docs</span></div></div>
+        </div>
+        <div className="footerBottom">RentPulse © 2026. Built for property stewards who need a paper trail.</div>
+      </footer>
     </main>
   );
 }
 
 function Feature({ icon, title, text }) {
   return <article className="feature">{icon}<h3>{title}</h3><p>{text}</p></article>;
+}
+
+function FAQ({ q, a }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="faqItem" onClick={() => setOpen(!open)}>
+      <div className="faqQ"><strong>{q}</strong><span className="faqToggle">{open ? '−' : '+'}</span></div>
+      {open && <p>{a}</p>}
+    </div>
+  );
 }
 
 function Auth({ onLogin, onBack }) {
